@@ -1,0 +1,29 @@
+# Personal data — everything below is specific to one user's install.
+credentials.txt
+queries.txt
+blacklist.txt
+additions_artists.txt
+additions_characters.txt
+
+# Database (+ WAL/journal sidecars)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Tag exports, if any were downloaded manually next to app.py
+tags*.csv
+tags*.csv.gz
+tag_aliases*.csv
+tag_aliases*.csv.gz
+tag_implications*.csv
+tag_implications*.csv.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
