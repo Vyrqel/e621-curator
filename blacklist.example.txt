@@ -1,0 +1,18 @@
+# blacklist.txt
+# e621-style blacklist. One clause per line.
+# Each line is a space-separated list of tags joined by AND.
+# Prefix a tag with `-` to negate (post must NOT have that tag).
+# `*` is a wildcard.
+# Lines starting with # are comments.
+#
+# A post is hidden if it matches ANY line.
+#
+# Examples:
+#
+#   wolf                               # any post tagged wolf is hidden
+#   gore male                          # only hidden if BOTH gore AND male are tagged
+#   scat -joke                         # scat posts hidden, unless also tagged joke
+#   rating:e -solo                     # explicit non-solo content hidden
+#   *_birth                            # any tag ending in _birth (egg_birth, etc)
+#
+# Add your tags below:

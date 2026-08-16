@@ -1,0 +1,9 @@
+# queries.txt
+# One e621 search per line. Either paste the full URL or just the tag string.
+# Lines starting with # are comments and ignored.
+#
+# Example URL:
+# https://e621.net/posts?tags=loona_%28helluva_boss%29+rating%3As+order%3Ascore
+#
+# Example tag string:
+# loona_(helluva_boss) rating:s order:score
