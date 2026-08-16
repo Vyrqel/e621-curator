@@ -1591,7 +1591,9 @@ def run_export_diff():
     dirty = []
     expunge = []
     skipped = 0
-    for tags, _last in rows:
+    for tags, _last in tqdm(
+        rows, desc="Export diff: compare", unit="tag", leave=False
+    ):
         count = lookup_post_count(tags)
         if count is None:
             if _tag_graph.canonical(tags.lower()) != tags.lower():
@@ -1611,7 +1613,9 @@ def run_export_diff():
     )
 
     expunged = 0
-    for tags in expunge:
+    for tags in tqdm(
+        expunge, desc="Export diff: expunge", unit="tag", leave=False
+    ):
         if confirm_tag_is_empty(tags):
             expunge_empty_tag(tags)
             expunged += 1
@@ -1623,7 +1627,9 @@ def run_export_diff():
         try:
             seen = get_seen_ids()
             blacklist = load_blacklist()
-            for tags, count in dirty:
+            for tags, count in tqdm(
+                dirty, desc="Export diff: scan", unit="tag", leave=False
+            ):
                 _scan_one_query(tags, seen, blacklist)
                 _purge_deleted_for_tag(tags)
                 if count is not None:
