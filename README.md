@@ -38,6 +38,15 @@ and every post's tags are cached locally in a compressed binary format.
   hide a deletion underneath it. A tag with no export row that resolves as an
   alias is scanned anyway; one that doesn't has no posts left and is expunged.
 
+  The deleted sweep (`_purge_deleted_for_tag`) is one page by default, and it
+  only ever purges IDs already held locally — the fetched page is intersected
+  against `seen` and `favorites`, and anything else is ignored. Note that
+  `status:deleted` sorts by post ID like every other search, so page 1 shows
+  the newest-*uploaded* deletions, not the most recently deleted. On a tag with
+  a long deletion history, an old post deleted yesterday can sit past the page
+  boundary and be missed. That's the accepted trade for a cheap opportunistic
+  sweep; expunge is the only caller that walks the full history.
+
   Queries actually worth scanning are OR-batched (up to 20 per request via
   e621's `~` syntax), so even a large dirty set costs few calls. Queries with
   new posts become **primed** and get served first.
@@ -326,8 +335,11 @@ runs slow rather than freezing.
   OR-batching safe.
 - Favorites enumeration is server-capped at 320 results/page regardless of
   the `limit` parameter; pagination stops on an empty page, not a short one.
-- Marking-as-seen happens on serve, not on next-click: closing the tab still
-  counts the post as seen. Trade-off: no duplicates after a crash.
+- Marking-as-seen happens on render, not on serve and not on next-click: the
+  frontend POSTs `/api/seen` once it actually displays the post. Closing the
+  tab after the post is on screen still counts it as seen; a post served but
+  never rendered (tab closed mid-fetch, failed POST) stays unseen and can come
+  back later. Review-mode and history navigation deliberately don't mark.
 - A tag that turns out to hold no posts at all is **expunged**: its query row
   and file lines are removed, but only after a sweep walks the tag's entire
   `status:deleted` history (capped at 25 pages) purging any locally-held IDs.
