@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ADHD621</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,500;9..144,700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-text">ADHD621</span>
+    </div>
+    <div class="override-box">
+      <div class="override-field">
+        <input type="text" id="override-input" class="override-input"
+          placeholder="override query (tag string or e621 URL)…" spellcheck="false" autocomplete="off" role="combobox"
+          aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
+        <div class="suggest" id="suggest" role="listbox" hidden></div>
+      </div>
+      <span id="persist-toggle-wrap" hidden>
+        <label class="override-toggle" title="When checked, page progress is saved to the database for this query">
+          <input type="checkbox" id="override-persist" checked>
+          <span>persist</span>
+        </label>
+      </span>
+      <button class="override-clear" id="override-clear" title="Clear override and return to queries.txt"
+        hidden>×</button>
+      <label class="override-toggle review-toggle"
+        title="Review mode: only show posts you've already seen. Session-scoped, doesn't modify the seen table.">
+        <input type="checkbox" id="review-mode">
+        <span>review</span>
+      </label>
+      <div class="review-counter" id="review-counter" hidden>
+        <input type="number" id="review-index-input" class="review-index-input" min="1" value="1"
+          title="Jump to a specific position">
+        <span class="review-counter-sep">/</span>
+        <span class="review-count-total" id="review-count-total">—</span>
+      </div>
+    </div>
+    <div class="stats" id="stats">
+      <span><em id="stat-queries">{{ query_count }}</em> queries</span>
+      <span><em id="stat-blacklist">—</em> blacklist</span>
+      <span><em id="stat-seen">—</em> seen</span>
+      <span><em id="stat-fav">—</em> favorites</span>
+      <span><em id="stat-add">—</em> additions</span>
+      <span title="Queries fully scanned"><em id="stat-exhausted">—</em> exhausted</span>
+      <span title="New posts found by background scanner"><em id="stat-primed">—</em> primed</span>
+    </div>
+  </header>
+
+  <main class="stage">
+
+    <section class="viewer" id="viewer">
+      <div class="placeholder" id="placeholder">
+        <div class="placeholder-mark"></div>
+        <p>press <kbd>Space</kbd> to begin</p>
+      </div>
+      <img id="image" alt="" hidden>
+      <div class="loading" id="loading" hidden>fetching…</div>
+      <div class="error" id="error" hidden></div>
+    </section>
+
+    <aside class="meta" id="meta" hidden>
+      <div class="meta-row">
+        <span class="meta-label">query</span>
+        <code class="meta-value" id="meta-query"></code>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">post</span>
+        <a class="meta-value" id="meta-link" target="_blank" rel="noopener"></a>
+      </div>
+
+      <div class="taglist">
+        <h3>artists</h3>
+        <div class="tags" id="tags-artists"></div>
+      </div>
+
+      <div class="taglist">
+        <h3>characters</h3>
+        <div class="tags" id="tags-characters"></div>
+      </div>
+    </aside>
+
+  </main>
+
+  <footer class="controls">
+    <div class="sys-controls">
+      <button class="btn btn-rescan" id="btn-rescan" title="Force rescan exhausted queries">↺</button>
+      <span class="conn-indicator" id="conn-indicator" title="Server connection">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span class="conn-label" id="conn-label">live</span>
+      </span>
+    </div>
+    <button class="btn btn-back" id="btn-back" title="Previous (B)">
+      <span class="key">B</span> back
+    </button>
+    <button class="btn btn-fav" id="btn-fav" title="Favorite (F)">
+      <span class="key">F</span> <span id="fav-label">favorite</span>
+    </button>
+    <button class="btn btn-next btn-primary" id="btn-next" title="Next (Space)">
+      <span class="key">␣</span> next
+    </button>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+
+</html>

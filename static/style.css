@@ -1,0 +1,871 @@
+:root {
+  --bg: #0e0c14;
+  --bg-elev: #16131e;
+  --bg-hi: #1d1929;
+  --line: #2a2438;
+  --ink: #e8e4f0;
+  --ink-dim: #9a93ad;
+  --ink-mute: #65607a;
+  --accent: #b8a3ff;
+  --accent-dim: #7a6aa8;
+  --warm: #ffb38a;
+  --warn: #ff7a8a;
+  --ok: #8aebb8;
+  --shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 14px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Fraunces', Georgia, serif;
+  font-feature-settings: 'ss01', 'ss02';
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.topbar,
+.stage,
+.controls {
+  position: relative;
+}
+
+.topbar,
+.controls {
+  background: var(--bg);
+}
+
+
+/* ---------- topbar ---------- */
+
+.topbar {
+  /* keep layout props */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 28px;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  /* Above .stage, which follows in the DOM and would otherwise paint over
+     anything escaping the bar. No overflow clipping here: the tag completion
+     dropdown is anchored inside the override box and has to hang below the
+     bar's bottom edge. */
+  z-index: 50;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-mark {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+}
+
+.brand-text {
+  font-family: 'Fraunces', serif;
+  font-weight: 300;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  font-style: italic;
+}
+
+.stats {
+  display: flex;
+  gap: 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stats em {
+  font-style: normal;
+  color: var(--ink);
+  font-weight: 500;
+  margin-right: 4px;
+}
+
+/* ---------- override box ---------- */
+
+.override-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 1 480px;
+  margin: 0 24px;
+}
+
+.override-field {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.override-input {
+  width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+  color: var(--ink);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.override-input::placeholder {
+  color: var(--ink-mute);
+  text-transform: none;
+}
+
+.override-input:focus {
+  border-color: var(--accent);
+  background: var(--bg-hi);
+}
+
+.override-input.active {
+  border-color: var(--accent);
+  background: rgba(184, 163, 255, 0.06);
+}
+
+/* ---------- tag completion ---------- */
+
+.suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 1;
+  /* within .topbar's stacking context, which sits above .stage */
+  /* Row height is pinned below rather than left to the font metrics, so this
+     cap is exact: SUGGEST_LIMIT rows fit with nothing left over. Keep the two
+     in step — if the backend limit goes up, raise the row count here or the
+     list starts scrolling for a full result set.
+
+     box-sizing is border-box globally, so max-height has to cover the 4px
+     padding and 1px border on BOTH edges, not just the rows. Missing the
+     2px of border is enough to trip the scrollbar on a full list. */
+  --suggest-row: 27px;
+  --suggest-rows: 12;
+  --suggest-chrome: 10px;
+  /* 4px padding + 1px border, top and bottom */
+  max-height: calc(var(--suggest-row) * var(--suggest-rows) + var(--suggest-chrome));
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+
+.suggest-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  height: var(--suggest-row);
+  padding: 0 8px;
+  line-height: var(--suggest-row);
+  border-radius: var(--r-sm);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+}
+
+.suggest-item.active,
+.suggest-item:hover {
+  background: var(--bg-hi);
+}
+
+.suggest-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The matched fragment, highlighted inside the name. */
+.suggest-name b {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* Left half of an alias row (the spelling that was typed). Shrinks before the
+   canonical tag does, so a long alias never squeezes out the tag you'd get. */
+.suggest-name.is-alias {
+  flex: 0 1 auto;
+}
+
+.suggest-arrow {
+  flex: 0 0 auto;
+  color: var(--ink-mute);
+}
+
+.suggest-count {
+  flex: 0 0 auto;
+  color: var(--ink-mute);
+  font-size: 10px;
+}
+
+/* Category tint, keyed to e621's own numbering — see TAG_CATEGORIES. */
+.suggest-item[data-cat="1"] .suggest-name {
+  color: var(--warm);
+}
+
+.suggest-item[data-cat="3"] .suggest-name {
+  color: var(--accent);
+}
+
+.suggest-item[data-cat="4"] .suggest-name {
+  color: var(--ok);
+}
+
+.suggest-item[data-cat="5"] .suggest-name {
+  color: #f2a2c0;
+}
+
+.suggest-item[data-cat="6"] .suggest-name {
+  color: var(--warn);
+}
+
+.suggest-item[data-cat="7"] .suggest-name {
+  color: var(--ink-dim);
+}
+
+.override-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.override-toggle input[type="checkbox"] {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-elev);
+  cursor: pointer;
+  position: relative;
+  transition: all 0.15s ease;
+}
+
+.override-toggle input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.override-toggle input[type="checkbox"]:checked::after {
+  content: "✓";
+  position: absolute;
+  top: -2px;
+  left: 2px;
+  font-size: 11px;
+  color: var(--bg);
+  font-weight: 700;
+}
+
+/* Review toggle uses a different accent to distinguish it from persist */
+.review-toggle input[type="checkbox"]:checked {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.review-toggle:has(input[type="checkbox"]:checked) {
+  color: var(--ok);
+}
+
+.review-counter {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--ok);
+  white-space: nowrap;
+}
+
+.review-counter[hidden] {
+  display: none;
+}
+
+.review-index-input {
+  width: 60px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 4px 6px;
+  color: var(--ok);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-align: right;
+  outline: none;
+  -moz-appearance: textfield;
+}
+
+.review-index-input::-webkit-outer-spin-button,
+.review-index-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.review-index-input:focus {
+  border-color: var(--ok);
+  background: var(--bg-hi);
+}
+
+.review-counter-sep {
+  color: var(--ink-mute);
+}
+
+.review-count-total {
+  color: var(--ok);
+}
+
+.override-clear {
+  background: transparent;
+  border: none;
+  color: var(--ink-mute);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  transition: color 0.15s ease;
+}
+
+.override-clear:hover {
+  color: var(--warn);
+}
+
+/* ---------- stage ---------- */
+
+.stage {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 0;
+  overflow: hidden;
+}
+
+.viewer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  overflow: hidden;
+}
+
+.viewer::before {
+  content: "";
+  position: absolute;
+  inset: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  pointer-events: none;
+}
+
+#image {
+  max-width: calc(100% - 64px);
+  max-height: calc(100% - 64px);
+  object-fit: contain;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  animation: fade-in 0.35s ease-out;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  color: var(--ink-mute);
+}
+
+.placeholder[hidden] {
+  display: none;
+}
+
+.placeholder-mark {
+  width: 60px;
+  height: 60px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  position: relative;
+}
+
+.placeholder-mark::after {
+  content: "";
+  position: absolute;
+  inset: 14px;
+  border-radius: 50%;
+  background: var(--accent-dim);
+  opacity: 0.4;
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    transform: scale(0.8);
+    opacity: 0.3;
+  }
+
+  50% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+}
+
+.placeholder p {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+
+.placeholder kbd {
+  background: var(--bg-hi);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 2px 8px;
+  font-family: inherit;
+  color: var(--accent);
+}
+
+.loading {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--ink-dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.error {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--warn);
+  max-width: 400px;
+  text-align: center;
+  line-height: 1.6;
+  padding: 16px 20px;
+  border: 1px solid rgba(255, 122, 138, 0.3);
+  border-radius: var(--r-md);
+  background: rgba(255, 122, 138, 0.05);
+}
+
+/* ---------- meta sidebar ---------- */
+
+.meta {
+  border-left: 1px solid var(--line);
+  background: var(--bg-elev);
+  padding: 28px 24px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.meta-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meta-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-mute);
+}
+
+.meta-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--ink-dim);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+a.meta-value {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a.meta-value:hover {
+  text-decoration: underline;
+}
+
+.taglist h3 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-mute);
+  margin-bottom: 10px;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-hi);
+  color: var(--ink);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.tag:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.tag.known {
+  opacity: 0.55;
+  cursor: default;
+  border-color: var(--ok);
+  color: var(--ok);
+  background: rgba(138, 235, 184, 0.05);
+}
+
+.tag.known::before {
+  content: "✓ ";
+  color: var(--ok);
+  font-weight: 500;
+}
+
+.tag.known:hover {
+  border-color: var(--ok);
+  color: var(--ok);
+  transform: none;
+}
+
+.tag.added {
+  background: rgba(184, 163, 255, 0.15);
+  border-color: var(--accent);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.tag.added:hover {
+  background: rgba(184, 163, 255, 0.25);
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.tag.added::after {
+  content: " ✓";
+  color: var(--ok);
+}
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  padding: 20px 28px;
+  border-top: 1px solid var(--line);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px;
+  padding: 11px 22px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--ink);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  letter-spacing: 0.01em;
+}
+
+.btn:hover {
+  background: var(--bg-hi);
+  border-color: var(--accent-dim);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn .key {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  border-radius: var(--r-sm);
+  color: var(--ink-dim);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+
+.btn-primary:hover {
+  background: #c9b6ff;
+  border-color: #c9b6ff;
+}
+
+.btn-primary .key {
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--bg);
+  border-color: transparent;
+}
+
+.btn-fav:hover {
+  border-color: var(--warm);
+  color: var(--warm);
+}
+
+.btn-back:hover {
+  border-color: var(--ink-dim);
+  color: var(--ink-dim);
+}
+
+.btn-fav.is-favorited {
+  border-color: var(--warm);
+  color: var(--warm);
+  background: rgba(255, 179, 138, 0.08);
+}
+
+.btn-fav.is-favorited:hover {
+  background: rgba(255, 179, 138, 0.15);
+}
+
+/* ---------- sys-controls (rescan + connection indicator) ---------- */
+
+.sys-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: absolute;
+  left: 28px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.btn-rescan {
+  font-size: 16px;
+  padding: 6px 10px;
+  line-height: 1;
+  border-radius: var(--r-sm);
+}
+
+.btn-rescan:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-confirm {
+  border-color: var(--warn) !important;
+  color: var(--warn) !important;
+}
+
+.conn-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  user-select: none;
+}
+
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+  flex-shrink: 0;
+}
+
+/* ---------- disconnected state ---------- */
+
+body.disconnected .conn-dot {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+  animation: conn-pulse 1.2s ease-in-out infinite;
+}
+
+body.disconnected .conn-label {
+  color: var(--warn);
+}
+
+@keyframes conn-pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* ---------- scanning / initializing state ---------- */
+body.status-scanning .conn-dot,
+body.status-initializing .conn-dot {
+  background: #e8c84a;
+  box-shadow: 0 0 8px #e8c84a;
+  animation: conn-pulse 1.6s ease-in-out infinite;
+}
+
+body.status-scanning .conn-label,
+body.status-initializing .conn-label {
+  color: #e8c84a;
+}
+
+body.disconnected {
+  background: #160c0c;
+}
+
+body.disconnected .btn {
+  border-color: rgba(255, 90, 90, 0.3);
+  color: rgba(255, 160, 160, 0.75);
+}
+
+body.disconnected .btn-primary {
+  background: rgba(180, 40, 40, 0.75);
+  border-color: rgba(180, 40, 40, 0.75);
+  color: #fff;
+}
+
+body.disconnected .override-input {
+  border-color: rgba(255, 90, 90, 0.25);
+  background: #1e1010;
+}
+
+body.disconnected .override-toggle input[type="checkbox"] {
+  border-color: rgba(255, 90, 90, 0.3);
+}
+
+body.disconnected .topbar,
+body.disconnected .controls {
+  border-color: rgba(180, 40, 40, 0.35);
+  background: #110c11;
+}
+
+body.disconnected .viewer::before {
+  border-color: rgba(180, 40, 40, 0.25);
+}
+
+body.disconnected .meta {
+  border-color: rgba(180, 40, 40, 0.35);
+  background: #160c0c;
+}
+
+body.disconnected .meta h3 {
+  color: rgba(255, 160, 160, 0.5);
+}
+
+body.disconnected .tag {
+  border-color: rgba(180, 40, 40, 0.3);
+  color: rgba(255, 160, 160, 0.6);
+}
+
+body.disconnected .meta-label {
+  color: rgba(255, 120, 120, 0.5);
+}
+
+body.disconnected .meta-value,
+body.disconnected .meta-value a {
+  color: rgba(255, 160, 160, 0.75);
+}
+
+/* tiny screen fallback */
+@media (max-width: 900px) {
+  .stage {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+  }
+
+  .meta {
+    border-left: none;
+    border-top: 1px solid var(--line);
+    max-height: 40vh;
+  }
+
+  .stats {
+    display: none;
+  }
+}
