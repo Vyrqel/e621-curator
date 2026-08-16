@@ -28,16 +28,39 @@ and every post's tags are cached locally in a compressed binary format.
    artists/characters into "additions" lists for later tracking.
 
 **Background machinery:**
-- **Scanner** — every 7 days, rescans queries that were previously exhausted.
-  Single-tag artist/character queries are OR-batched (up to 20 per request
-  using e621's `~` syntax) so a large exhausted list costs very few API calls.
-  Queries with new posts become **primed** and get served first.
-- **Favorites sync** — periodically enumerates your e621 favorites and
-  reconciles them with the local table, both directions.
-- **Tag backfill** — every 6 hours, fetches tags for any locally-referenced
-  posts missing from the tag cache (batched via `id:a,b,c` + `status:any`).
-  Posts confirmed gone from e621 are purged, with an individual per-post
-  verification step before deletion.
+- **Scanner** — driven by tag-export deltas, not a timer. The blanket periodic
+  page-1 sweep is gone: when an exhausted query is recorded, so is its
+  `post_count` at that moment, and `run_export_diff()` (fired from the tag-data
+  thread after every export check) compares that baseline against the current
+  export. A tag whose count hasn't moved provably gained nothing and costs zero
+  requests. A tag whose count moved **in either direction** gets page 1 scanned
+  *and* a `status:deleted` sweep — a drop means posts went away, and a rise can
+  hide a deletion underneath it. A tag with no export row that resolves as an
+  alias is scanned anyway; one that doesn't has no posts left and is expunged.
+
+  Queries actually worth scanning are OR-batched (up to 20 per request via
+  e621's `~` syntax), so even a large dirty set costs few calls. Queries with
+  new posts become **primed** and get served first.
+
+  Known cost of dropping the periodic sweep: deletions that exactly cancel out
+  additions within a single export window are invisible to the diff and get
+  missed. `_scan_exhausted_queries()` still exists and still checks everything
+  — it's what the ↺ force-rescan button calls, and it's exhaustive every time.
+- **Favorites sync** — enumerates your e621 favorites and reconciles them with
+  the local table, both directions. Runs as the first half of the maintenance
+  chain (`start_maintenance`), which fires at startup and after a
+  client-triggered rescan rather than sleeping on a timer.
+- **Tag backfill** — the second half of that same chain, fetches tags for any
+  locally-referenced post *missing* from the tag cache, batched via `id:a,b,c`
+  + `status:any`. It only ever touches the uncached subset, so an idle pass is
+  essentially free — one `COUNT` query and zero API calls. Real work only
+  shows up for posts seen before the tag cache existed and for favorites
+  synced off e621 (which arrive as just `post_id` + `favorited_at`); normal
+  browsing self-caches via `cache_post_from_response`. Posts confirmed gone
+  are purged, with an individual per-post verification step before deletion.
+
+  The heavy counterpart is `--refresh-tags`, which deliberately re-touches
+  every referenced post so upstream tag edits get picked up.
 - **Tag data** — polls e621's export manifest and re-ingests the tags, alias,
   and implication dumps when their checksums change (see below).
 - **Refresh resume** — if a `--refresh-tags` sweep was interrupted, startup

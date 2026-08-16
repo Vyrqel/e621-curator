@@ -60,9 +60,6 @@ _last_request_time = 0.0
 _server_state = {"status": "initializing"}  # "initializing" | "scanning" | "live"
 
 POSTS_PER_PAGE = 320  # e621 max
-SCANNER_INTERVAL = (
-    604800  # 7 days — most artists post at most ~2/week so weekly suffices
-)
 MAX_PRIMED_ATTEMPTS = 8
 RESCAN_BATCH_TAGS = (
     20  # OR-combine up to N exhausted (artist/character) queries into one gate request
@@ -74,10 +71,9 @@ RESCAN_BATCH_TAGS = (
 # carry post_id + favorited_at). New browsing self-caches via
 # cache_post_from_response, so this only ever has real work on the historical
 # backlog and on freshly-synced favorites. Posts confirmed gone from e621 are
-# purged from the db (see backfill_tag_cache).
-BACKFILL_INTERVAL = (
-    604800  # 7 days — idle passes are ~free (one COUNT query, zero API calls)
-)
+# purged from the db (see backfill_tag_cache). It runs as part of the
+# event-driven maintenance chain (startup / post-rescan), not on a timer —
+# idle passes are ~free anyway (one COUNT query, zero API calls).
 
 # Tag data exports. e621 publishes a nightly CSV dump of its tags,
 # tag_aliases and tag_implications tables, and a manifest listing every export
@@ -1665,15 +1661,12 @@ def check_blacklist_change():
         )
 
 
-def _scan_exhausted_queries(force=False):
-    """Check page 1 of exhausted queries for new posts.
+def _scan_exhausted_queries():
+    """Check page 1 of every exhausted query for new posts.
 
-    If force=False (default), queries scanned within SCANNER_INTERVAL are
-    skipped — useful when the server restarts frequently and we don't want
-    to re-hammer the API for queries that were just scanned.
-
-    If force=True, every exhausted query is scanned regardless of when it
-    was last checked.
+    Unconditional and exhaustive — this is the client-triggered force rescan.
+    Routine scanning is driven by run_export_diff() off tag-export post_count
+    deltas, so there is no freshness guard here.
     """
     _server_state["status"] = "scanning"
     try:
@@ -1682,34 +1675,11 @@ def _scan_exhausted_queries(force=False):
             log.info("Scanner: no exhausted queries to check.")
             return
 
-        now = int(time.time())
-        if force:
-            to_scan = [(tags, last) for (tags, last) in rows]
-            skipped = 0
-        else:
-            to_scan = []
-            skipped = 0
-            for tags, last in rows:
-                if last is None or (now - last) >= SCANNER_INTERVAL:
-                    to_scan.append((tags, last))
-                else:
-                    skipped += 1
-
-        if not to_scan:
-            log.info(
-                f"Scanner: all {len(rows)} exhausted queries scanned recently "
-                f"(within {SCANNER_INTERVAL}s); skipping this pass."
-            )
-            return
-
         seen = get_seen_ids()
         blacklist = load_blacklist()
-        log.info(
-            f"Scanner: checking {len(to_scan)} exhausted queries for new posts "
-            f"({skipped} skipped as fresh, force={force})."
-        )
+        log.info(f"Scanner: checking {len(rows)} exhausted queries for new posts.")
 
-        tags_list = [tags for tags, _ in to_scan]
+        tags_list = [tags for tags, _ in rows]
         for i in tqdm(
             range(0, len(tags_list), RESCAN_BATCH_TAGS),
             desc="Scanner: rescan",
@@ -2420,8 +2390,8 @@ def backfill_tag_cache():
     """Fetch and cache tags for any locally-referenced post missing from the
     tag cache, batched over the `id:` metatag. Posts confirmed gone are purged.
 
-    Runs on the periodic background loop, so it stays scoped to the uncached
-    subset rather than re-touching everything.
+    Runs as the second half of the maintenance chain, so it stays scoped to
+    the uncached subset rather than re-touching everything.
     """
     ids = get_uncached_post_ids()
     if not ids:
@@ -4918,7 +4888,7 @@ def api_force_rescan():
 
     def _do_scan():
         try:
-            _scan_exhausted_queries(force=True)
+            _scan_exhausted_queries()
         except Exception as e:
             log.error(f"Force rescan error: {e}")
         # Re-run maintenance in order: favorites sync first, then backfill.
