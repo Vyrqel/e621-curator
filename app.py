@@ -47,8 +47,7 @@ ADDITIONS_ARTISTS_FILE = ROOT / "additions_artists.txt"
 ADDITIONS_CHARACTERS_FILE = ROOT / "additions_characters.txt"
 
 # IMPORTANT: e621 requires a descriptive User-Agent with contact info.
-# Replace with your actual e621 username before running.
-USER_AGENT = "e621-curator-rc/1.0 (by Vyrqel on e621)"
+USER_AGENT = "e621-curator-closedbeta/1.0 (by Vyrqel on e621)"
 
 # Post endpoints are called with v2=true&mode=extended unconditionally and
 # post objects are consumed in v2 shape (see the accessors near _v2_params).
