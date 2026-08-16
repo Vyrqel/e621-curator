@@ -79,8 +79,8 @@ negates, `*` wildcards, `rating:` metatags work. Re-read on every request, so
 you can edit it live.
 
 ```
-small_penis              # single-tag exclusion
-gore young               # only if BOTH tags present
+wolf                     # single-tag exclusion
+gore male                # only if BOTH tags present
 scat -joke               # scat unless also tagged joke
 rating:e -solo           # explicit non-solo
 *_birth                  # wildcard suffix
