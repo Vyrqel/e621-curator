@@ -1959,10 +1959,30 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
         return None
 
 
+def _static_version(filename):
+    """mtime of a file in static/, for cache-busting its URL.
+
+    Flask serves /static with a long max-age, so an edited app.js or
+    style.css keeps coming out of the browser cache no matter how many times
+    the server restarts. Stamping the URL with the file's mtime makes every
+    edit a new URL. Returns 0 if the file is missing, which just means no
+    stamp rather than a broken page.
+    """
+    try:
+        return int((ROOT / "static" / filename).stat().st_mtime)
+    except OSError:
+        return 0
+
+
 @app.route("/")
 def index():
     queries = load_queries()
-    return render_template("index.html", query_count=len(queries))
+    return render_template(
+        "index.html",
+        query_count=len(queries),
+        js_version=_static_version("app.js"),
+        css_version=_static_version("style.css"),
+    )
 
 
 def mark_post_seen(post_id):

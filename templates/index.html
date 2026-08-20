@@ -10,7 +10,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,500;9..144,700&family=JetBrains+Mono:wght@400;500&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ css_version }}">
 </head>
 
 <body>
@@ -79,10 +79,7 @@
         <a class="meta-value" id="meta-link" target="_blank" rel="noopener"></a>
       </div>
 
-      <div class="taglist" id="relations-block" hidden>
-        <h3>relations</h3>
-        <div class="relations" id="relations"></div>
-      </div>
+      <div id="relations-rows"></div>
 
       <div class="taglist">
         <h3>artists</h3>
@@ -116,7 +113,7 @@
     </button>
   </footer>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ js_version }}"></script>
 </body>
 
 </html>

@@ -872,46 +872,20 @@ body.disconnected .meta-value a {
 
 
 /* ---------- Post relations (parent / children / pool) ---------- */
+/*
+ * Rendered as meta-rows carrying a.meta-value links, same as the post link
+ * above them -- these are pointers to e621, so they look and behave like
+ * every other pointer to e621 in this panel.
+ */
 
-.relations {
+.relation-links {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px 12px;
 }
 
-.rel {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11px;
-  padding: 5px 10px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--line);
-  background: var(--bg-hi);
-  color: var(--ink);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.rel:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.rel-kind {
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--ink-mute);
-}
-
-.rel:hover .rel-kind {
-  color: var(--accent);
-}
-
-.rel-none {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11px;
-  color: var(--ink-mute);
-  opacity: 0.6;
+/* The wrapper is a layout no-op — its rows become direct .meta flex items,
+   so an empty relations set contributes no gap under the post link. */
+#relations-rows {
+  display: contents;
 }
