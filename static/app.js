@@ -8,8 +8,7 @@ const els = {
   meta: $("meta"),
   metaQuery: $("meta-query"),
   metaLink: $("meta-link"),
-  relationsBlock: $("relations-block"),
-  relations: $("relations"),
+  relationsRows: $("relations-rows"),
   tagsArtists: $("tags-artists"),
   tagsCharacters: $("tags-characters"),
   btnNext: $("btn-next"),
@@ -301,93 +300,72 @@ async function fetchAndPreload() {
  * already seen and we don't want to overwrite seen_at.
  */
 /**
- * Render the parent / children / pool chips for a post.
+ * Render the parent / children / pool links for a post.
  *
- * Each chip is a one-click jump to the search that reassembles that
- * relationship, using the search strings the backend built:
- *   parent post  -> child:<this post>    (walks up; resolved server-side)
- *   siblings     -> parent:<parent_id>   (everything sharing that parent)
- *   children     -> parent:<this post>   (walks down)
- *   pool         -> pool:<pool_id>
+ * These are meta-rows in the same shape as the "post" row above them, and
+ * their links are ordinary a.meta-value anchors to e621 that open in a new
+ * tab — same style, same behaviour. Nothing here touches the override bar.
  *
- * `child:<id>` is this app's own metatag, not e621's — the backend rewrites
- * it into an `id:` search before the request goes out.
- *
- * Chips run as non-persisting overrides — these are one-off lookups and
- * shouldn't write page progress into query_progress.
+ * Parent and children point at post permalinks (we know the exact IDs);
+ * pools point at the pool page.
  */
 function renderRelations(rel) {
-  const box = els.relations;
+  const box = els.relationsRows;
   box.innerHTML = "";
+  if (!rel) return;
 
-  if (!rel) {
-    els.relationsBlock.hidden = true;
-    return;
-  }
-
-  const chips = [];
+  const rows = [];
   if (rel.parent_id) {
-    chips.push({
-      kind: "parent",
-      text: `#${rel.parent_id}`,
-      search: rel.searches.parent,
-    });
-    chips.push({
-      kind: "siblings",
-      text: "family",
-      search: rel.searches.siblings,
+    rows.push({
+      label: "parent",
+      links: [{ text: `#${rel.parent_id}`, url: postUrl(rel.parent_id) }],
     });
   }
   if (rel.children && rel.children.length) {
-    chips.push({
-      kind: "children",
-      text: rel.children.length === 1
-        ? `#${rel.children[0]}`
-        : `${rel.children.length} posts`,
-      search: rel.searches.children,
-      title: rel.children.map((id) => `#${id}`).join(" "),
+    rows.push({
+      label: rel.children.length === 1 ? "child" : "children",
+      links: rel.children.map((id) => ({ text: `#${id}`, url: postUrl(id) })),
     });
   }
-  (rel.pools || []).forEach((poolId) => {
-    chips.push({
-      kind: "pool",
-      text: `#${poolId}`,
-      search: `pool:${poolId}`,
+  if (rel.pools && rel.pools.length) {
+    rows.push({
+      label: rel.pools.length === 1 ? "pool" : "pools",
+      links: rel.pools.map((id) => ({ text: `#${id}`, url: poolUrl(id) })),
     });
-  });
-
-  if (!chips.length) {
-    // Nothing to show, but the block staying visible-and-empty reads as a
-    // bug. Hide it; a standalone post is the common case.
-    els.relationsBlock.hidden = true;
-    return;
   }
 
-  chips.forEach((chip) => {
-    const el = document.createElement("button");
-    el.className = "rel";
-    el.type = "button";
-    el.title = chip.title ? `${chip.search} — ${chip.title}` : chip.search;
-    const kind = document.createElement("span");
-    kind.className = "rel-kind";
-    kind.textContent = chip.kind;
+  rows.forEach((row) => {
+    const rowEl = document.createElement("div");
+    rowEl.className = "meta-row";
+
     const label = document.createElement("span");
-    label.textContent = chip.text;
-    el.append(kind, label);
-    el.addEventListener("click", () => jumpToSearch(chip.search));
-    box.appendChild(el);
-  });
+    label.className = "meta-label";
+    label.textContent = row.label;
+    rowEl.appendChild(label);
 
-  els.relationsBlock.hidden = false;
+    const links = document.createElement("div");
+    links.className = "relation-links";
+    row.links.forEach((link) => {
+      const a = document.createElement("a");
+      a.className = "meta-value";
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.href = link.url;
+      a.textContent = link.text;
+      links.appendChild(a);
+    });
+    rowEl.appendChild(links);
+
+    box.appendChild(rowEl);
+  });
 }
 
-/** Load a relation search into the override bar and fetch immediately. */
-function jumpToSearch(search) {
-  if (!search) return;
-  els.overrideInput.value = search;
-  els.overridePersist.checked = false;
-  updateOverrideUI();
-  fetchNext();
+function postUrl(id) {
+  return `https://e621.net/posts/${id}`;
+}
+
+function poolUrl(id) {
+  return `https://e621.net/pools/${id}`;
 }
 
 function renderPost(data) {
