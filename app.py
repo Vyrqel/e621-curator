@@ -428,6 +428,26 @@ CREATE TABLE IF NOT EXISTS post_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_post_tags_cached_at ON post_tags(cached_at);
 
+-- Post relationships: parent/child links and pool membership, kept apart
+-- from post_tags because they answer a different question and change on a
+-- different schedule. One row per post; absence of a row means "never
+-- looked", while a row with parent_id NULL, no children and no pools means
+-- "looked, and the post is standalone".
+--
+-- children/pools are stored as comma-separated ID lists rather than join
+-- tables: e621 hands them over as whole lists, we only ever read them as
+-- whole lists, and the sets are small (a handful of children, rarely more
+-- than one pool). parent_id gets its own column and index because that IS
+-- queried across posts -- it's how a family is reassembled locally.
+CREATE TABLE IF NOT EXISTS post_relations (
+    post_id INTEGER PRIMARY KEY,
+    parent_id INTEGER,             -- NULL when the post has no parent
+    children TEXT NOT NULL DEFAULT '',  -- comma-separated post IDs, ascending
+    pools TEXT NOT NULL DEFAULT '',     -- comma-separated pool IDs, ascending
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_post_relations_parent ON post_relations(parent_id);
+
 CREATE TABLE IF NOT EXISTS tag_dicts (
     -- 'dict' = current (blobs flagged 1 reference this), 'dict_old' =
     -- previous (blobs flagged 0, stranded because they failed to rewrite
@@ -1998,6 +2018,194 @@ def set_post_tag_cache(post_id, tags_dict, rating):
         )
 
 
+# ---------- Post relationships (parents, children, pools) ----------
+#
+# Populated from the same responses that feed the tag cache, so tracking
+# relationships costs zero extra API calls. Everything here is a snapshot of
+# what e621 said at fetch time; the refresh/backfill sweeps re-assert it.
+
+
+def _csv_ids(values):
+    """Normalise an ID list into the stored comma-separated form."""
+    out = sorted({int(v) for v in (values or []) if str(v).strip().isdigit() or isinstance(v, int)})
+    return ",".join(str(v) for v in out)
+
+
+def _parse_csv_ids(text):
+    """Inverse of _csv_ids. Empty/NULL text yields []."""
+    if not text:
+        return []
+    return [int(tok) for tok in text.split(",") if tok]
+
+
+def extract_relations(post):
+    """Pull (parent_id, children, pools) out of a full e621 post object.
+
+    Reads the v2 `relationships` block and the top-level `pools` array. A
+    post with none of these still returns a valid tuple -- "no relations" is
+    a fact worth recording, not a reason to skip the row.
+    """
+    rel = post.get("relationships") or {}
+    parent_id = rel.get("parent_id")
+    try:
+        parent_id = int(parent_id) if parent_id is not None else None
+    except (TypeError, ValueError):
+        parent_id = None
+    return parent_id, list(rel.get("children") or []), list(post.get("pools") or [])
+
+
+def set_post_relations(post_id, parent_id, children, pools):
+    """Upsert the relationship row for a post."""
+    with db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO post_relations
+               (post_id, parent_id, children, pools, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (post_id, parent_id, _csv_ids(children), _csv_ids(pools), int(time.time())),
+        )
+
+
+def get_post_relations(post_id):
+    """Return the stored relations for a post, or None if never looked up.
+
+    Shape:
+        {"parent_id": int|None, "children": [int], "pools": [int],
+         "updated_at": int}
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM post_relations WHERE post_id = ?", (post_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "parent_id": row["parent_id"],
+        "children": _parse_csv_ids(row["children"]),
+        "pools": _parse_csv_ids(row["pools"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def relations_search_tags(post_id, relations):
+    """Build the search strings that reassemble a post's context.
+
+    `parent:<id>` is e621's own metatag: posts whose parent is <id>, i.e.
+    the child set of <id>. It does NOT include <id> itself.
+
+    `child:<id>` is OURS -- e621 only has the boolean child:none/child:any,
+    with no ID form, so there is no upstream way to ask "which post is the
+    parent of <id>". expand_child_metatag() resolves it locally into an
+    `id:` search before anything reaches the API. Defining it this way makes
+    it the exact mirror of parent:: parent:X walks down, child:X walks up.
+
+    Returns a dict of label -> tag string, omitting anything that doesn't
+    apply to this post.
+    """
+    out = {}
+    if not relations:
+        return out
+    if relations.get("parent_id"):
+        # Walk up to the parent itself.
+        out["parent"] = f"child:{post_id}"
+        # And the rest of the family: everything sharing that parent.
+        out["siblings"] = f"parent:{relations['parent_id']}"
+    if relations.get("children"):
+        out["children"] = f"parent:{post_id}"
+    for pool_id in relations.get("pools") or []:
+        out[f"pool:{pool_id}"] = f"pool:{pool_id}"
+    return out
+
+
+# `child:<id>` -- our own metatag, resolved before the query leaves the app.
+_CHILD_METATAG = re.compile(r"(?<!\S)child:(\d+)(?!\S)")
+
+# What an unresolvable child: search becomes. `id:0` is a well-formed search
+# for a post ID that cannot exist, so it returns nothing instead of silently
+# dropping the constraint and matching the entire site.
+_IMPOSSIBLE_QUERY = "id:0"
+
+
+def _parent_of(post_id):
+    """Parent post ID of `post_id`, or None if it has none.
+
+    Checks the local relations table first -- for anything already curated
+    the answer is free. Falls back to a single-post fetch, caching the whole
+    response on the way through so the next lookup is local too.
+    """
+    rel = get_post_relations(post_id)
+    if rel is not None:
+        return rel["parent_id"]
+    try:
+        post = _fetch_post_by_id(post_id)
+    except Exception as e:
+        log.warning(f"child:{post_id} lookup failed: {e}")
+        return None
+    if not post:
+        return None
+    cache_post_from_response(post)
+    parent_id, _, _ = extract_relations(post)
+    return parent_id
+
+
+def expand_child_metatag(tags):
+    """Rewrite every `child:<id>` token in a query into `id:<parent_id>`.
+
+    e621 never sees `child:` -- it wouldn't understand the ID form. Tokens
+    it DOES understand (`child:none`, `child:any`) don't match the pattern
+    and pass through untouched.
+
+    A post with no parent, or one that can't be resolved, collapses the
+    whole query to `id:0` so the search returns nothing rather than
+    quietly widening.
+    """
+    if "child:" not in tags:
+        return tags
+
+    impossible = False
+
+    def _sub(match):
+        nonlocal impossible
+        child_id = int(match.group(1))
+        parent_id = _parent_of(child_id)
+        if parent_id is None:
+            log.info(f"child:{child_id} -> no parent; query yields nothing.")
+            impossible = True
+            return _IMPOSSIBLE_QUERY
+        log.info(f"child:{child_id} -> id:{parent_id}")
+        return f"id:{parent_id} status:any"
+
+    rewritten = _CHILD_METATAG.sub(_sub, tags)
+    return _IMPOSSIBLE_QUERY if impossible else rewritten
+
+
+def cache_relations_from_response(post):
+    """Record relationships straight off a fetched post object."""
+    if not post or "id" not in post:
+        return
+    parent_id, children, pools = extract_relations(post)
+    set_post_relations(post["id"], parent_id, children, pools)
+
+
+def get_unrelated_post_ids():
+    """Referenced post IDs with no relationship row yet.
+
+    Mirrors get_uncached_post_ids(); both feed the same backfill sweep.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT post_id FROM (
+                SELECT post_id FROM seen
+                UNION
+                SELECT post_id FROM favorites
+            )
+            WHERE post_id NOT IN (SELECT post_id FROM post_relations)
+            ORDER BY post_id
+            """
+        ).fetchall()
+    return [r["post_id"] for r in rows]
+
+
 def cache_post_from_response(post):
     """Update the tag cache from a fully-fetched e621 post object.
 
@@ -2009,6 +2217,7 @@ def cache_post_from_response(post):
     tags_dict = post.get("tags") or {}
     rating = post.get("rating")
     set_post_tag_cache(post["id"], tags_dict, rating)
+    cache_relations_from_response(post)
 
 
 # ---------- Tag-cache backfill ----------
@@ -2060,6 +2269,7 @@ def purge_post(post_id):
         conn.execute("DELETE FROM seen WHERE post_id = ?", (post_id,))
         conn.execute("DELETE FROM favorites WHERE post_id = ?", (post_id,))
         conn.execute("DELETE FROM post_tags WHERE post_id = ?", (post_id,))
+        conn.execute("DELETE FROM post_relations WHERE post_id = ?", (post_id,))
 
 
 def _is_locally_favorited(post_id):
@@ -2399,11 +2609,11 @@ def backfill_tag_cache():
     Runs as the second half of the maintenance chain, so it stays scoped to
     the uncached subset rather than re-touching everything.
     """
-    ids = get_uncached_post_ids()
+    ids = sorted(set(get_uncached_post_ids()) | set(get_unrelated_post_ids()))
     if not ids:
         return {"cached": 0, "purged": 0}
 
-    log.info(f"Tag backfill: {len(ids)} post(s) missing cached tags.")
+    log.info(f"Tag backfill: {len(ids)} post(s) missing cached tags or relations.")
     result = _process_tag_batches(ids, POSTS_PER_PAGE, "Tag backfill")
     log.info(
         f"Tag backfill: cached {result['cached']}, "
@@ -4080,6 +4290,120 @@ def _parse_query_string(query):
     return terms
 
 
+# Metatags that answer from post_relations / the post ID rather than from the
+# tag set. Review mode filters against the local cache, so without these a
+# search like `pool:52413` is matched as if "pool:52413" were a literal tag --
+# it never matches anything and the review list comes back empty.
+_RELATION_PREFIXES = (
+    "parent:",
+    "child:",
+    "pool:",
+    "id:",
+    "status:",
+    "ischild:",
+    "hasparent:",
+    "isparent:",
+    "haschild:",
+    "haschildren:",
+)
+
+# Boolean forms and what they assert. True = "must have the relation".
+_RELATION_FLAGS = {
+    "ischild": "parent",
+    "hasparent": "parent",
+    "isparent": "children",
+    "haschild": "children",
+    "haschildren": "children",
+}
+
+_EMPTY_RELATIONS = {"parent_id": None, "children": [], "pools": []}
+
+
+def is_relation_term(pattern):
+    """True if `pattern` is one of the metatags handled by relation matching."""
+    return pattern.startswith(_RELATION_PREFIXES)
+
+
+def get_relations_map(post_ids):
+    """Bulk-load relations for many posts at once: {post_id: relations}.
+
+    Posts with no row are omitted -- callers treat a miss as "no relations
+    known", which _relation_term_matches() handles via _EMPTY_RELATIONS.
+    """
+    out = {}
+    ids = list(post_ids)
+    if not ids:
+        return out
+    CHUNK = 900  # stay under SQLite's variable limit
+    with db() as conn:
+        for start in range(0, len(ids), CHUNK):
+            batch = ids[start : start + CHUNK]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT * FROM post_relations WHERE post_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                out[row["post_id"]] = {
+                    "parent_id": row["parent_id"],
+                    "children": _parse_csv_ids(row["children"]),
+                    "pools": _parse_csv_ids(row["pools"]),
+                }
+    return out
+
+
+def _relation_term_matches(pattern, post_id, rel):
+    """Evaluate one relation metatag against a post. Returns True/False.
+
+    `rel` is a relations dict (or None, treated as "no relations known").
+    Anything unparseable evaluates False rather than raising -- a malformed
+    metatag should narrow the search, not blow up the request.
+    """
+    rel = rel or _EMPTY_RELATIONS
+    name, _, value = pattern.partition(":")
+
+    if name in _RELATION_FLAGS:
+        field = _RELATION_FLAGS[name]
+        has = bool(rel["parent_id"]) if field == "parent" else bool(rel["children"])
+        return has if value == "true" else (not has) if value == "false" else False
+
+    if name == "status":
+        # No local equivalent -- every cached post is a live post. Treated as
+        # satisfied so `status:any` (appended by child: expansion) is a no-op
+        # here instead of emptying the list.
+        return True
+
+    if name == "id":
+        wanted = {int(t) for t in value.split(",") if t.strip().isdigit()}
+        return post_id in wanted
+
+    if name == "parent":
+        if value == "none":
+            return rel["parent_id"] is None
+        if value == "any":
+            return rel["parent_id"] is not None
+        return value.isdigit() and rel["parent_id"] == int(value)
+
+    if name == "child":
+        # Mirror of parent:, same as the API-side metatag -- child:<id>
+        # selects the post that IS the parent of <id>. Answered straight
+        # from the stored child list, no lookup needed.
+        if value == "none":
+            return not rel["children"]
+        if value == "any":
+            return bool(rel["children"])
+        return value.isdigit() and int(value) in rel["children"]
+
+    if name == "pool":
+        if value == "none":
+            return not rel["pools"]
+        if value == "any":
+            return bool(rel["pools"])
+        return value.isdigit() and int(value) in rel["pools"]
+
+    return False
+
+
 def _get_local_favorite_ids():
     """Return the set of post IDs currently in the local favorites table."""
     with db() as conn:
@@ -4087,21 +4411,38 @@ def _get_local_favorite_ids():
     return {r["post_id"] for r in rows}
 
 
-def _post_matches_query_with_favs(tags_dict, rating, post_id, query, favorite_ids):
-    """Internal matcher that takes a pre-fetched favorite_ids set."""
+def _post_matches_query_with_favs(
+    tags_dict, rating, post_id, query, favorite_ids, relations=None
+):
+    """Internal matcher that takes a pre-fetched favorite_ids set.
+
+    `relations` is the post's row from post_relations (see get_relations_map).
+    It's only consulted when the query actually contains a relation metatag;
+    passing None means "none known", which makes parent:/child:/pool: terms
+    evaluate False rather than silently matching.
+    """
     terms = _parse_query_string(query)
     if not terms:
         return True
 
     all_tags = _flatten_post_tags(tags_dict, rating)
     fav_terms = [(pat, neg) for (pat, neg) in terms if pat.startswith("fav:")]
-    regular_terms = [(pat, neg) for (pat, neg) in terms if not pat.startswith("fav:")]
+    rel_terms = [(pat, neg) for (pat, neg) in terms if is_relation_term(pat)]
+    regular_terms = [
+        (pat, neg)
+        for (pat, neg) in terms
+        if not pat.startswith("fav:") and not is_relation_term(pat)
+    ]
 
     if fav_terms:
         is_favorited = post_id in favorite_ids
         for _, negated in fav_terms:
             if is_favorited == negated:
                 return False
+
+    for pattern, negated in rel_terms:
+        if _relation_term_matches(pattern, post_id, relations) == negated:
+            return False
 
     for pattern, negated in regular_terms:
         matches = _tag_matches(pattern, all_tags)
@@ -4122,7 +4463,38 @@ def post_matches_query(tags_dict, rating, post_id, query):
     terms = _parse_query_string(query)
     if any(pat.startswith("fav:") for pat, _ in terms):
         fav_ids = _get_local_favorite_ids()
-    return _post_matches_query_with_favs(tags_dict, rating, post_id, query, fav_ids)
+    relations = (
+        get_post_relations(post_id)
+        if any(is_relation_term(pat) for pat, _ in terms)
+        else None
+    )
+    return _post_matches_query_with_favs(
+        tags_dict, rating, post_id, query, fav_ids, relations
+    )
+
+
+def _relations_payload(post):
+    """Relationship block for the frontend.
+
+    Read straight off the fetched post -- it's authoritative and already in
+    hand. Falls back to the stored row only if the response somehow lacks
+    the fields (an abbreviated payload from a cached path).
+    """
+    pid = post["id"]
+    if "relationships" in post or "pools" in post:
+        parent_id, children, pools = extract_relations(post)
+        rel = {"parent_id": parent_id, "children": sorted(set(children)),
+               "pools": sorted(set(pools))}
+    else:
+        rel = get_post_relations(pid) or {
+            "parent_id": None, "children": [], "pools": []
+        }
+    return {
+        "parent_id": rel["parent_id"],
+        "children": rel["children"],
+        "pools": rel["pools"],
+        "searches": relations_search_tags(pid, rel),
+    }
 
 
 def _build_post_response(post, query, known, from_primed):
@@ -4168,6 +4540,7 @@ def _build_post_response(post, query, known, from_primed):
         "rating": post.get("rating"),
         "score": post_score(post),
         "post_url": f"https://e621.net/posts/{post['id']}",
+        "relations": _relations_payload(post),
     }
 
 
@@ -4248,6 +4621,13 @@ def api_next():
         persist = False  # URL-derived overrides never touch the exhausted list
 
     override = override.lower()
+    if override:
+        expanded = expand_child_metatag(override)
+        if expanded != override:
+            # Resolved to a concrete id: search -- never persist page
+            # progress against it, the tag string is synthetic.
+            override = expanded
+            persist = False
 
     if override:
         queries = [override]
@@ -4321,7 +4701,9 @@ def _build_review_list(override_tags=None):
 
     If override_tags is provided, filter using the LOCAL tag cache rather
     than searching e621. Posts whose tags aren't cached yet are excluded
-    (they'll become reviewable once their cache is populated by display).
+    (they'll become reviewable once their cache is populated by display) --
+    unless every term answers from another table (fav:, parent:, child:,
+    pool:), in which case the tag cache isn't needed at all.
 
     Returns:
         ids: filtered post IDs (or all seen if no override)
@@ -4361,26 +4743,39 @@ def _build_review_list(override_tags=None):
     uses_fav = any(pat.startswith("fav:") for pat, _ in terms)
     favorite_ids = _get_local_favorite_ids() if uses_fav else set()
 
+    # Same idea as the favorites pre-fetch: one bulk read instead of a query
+    # per post. Skipped entirely unless the override actually uses parent:,
+    # child:, pool: or friends.
+    uses_relations = any(is_relation_term(pat) for pat, _ in terms)
+    relations_map = get_relations_map(seen_ordered) if uses_relations else {}
+
     matched = []
     uncached = 0
 
-    # Determine if there are any terms that actually require the tag cache
-    non_fav_terms = [(pat, neg) for (pat, neg) in terms if not pat.startswith("fav:")]
+    # Terms that actually require the tag cache. fav: and the relation
+    # metatags answer from their own tables, so a query made only of those
+    # (`pool:52413`, `parent:any`) can be evaluated for a post whose tags
+    # were never cached -- it shouldn't be counted as uncached and dropped.
+    tag_terms = [
+        (pat, neg)
+        for (pat, neg) in terms
+        if not pat.startswith("fav:") and not is_relation_term(pat)
+    ]
 
     for pid in seen_ordered:
         cached = cache_map.get(pid)
         if cached is None:
-            if non_fav_terms:
+            if tag_terms:
                 # Can't evaluate tag-dependent terms without cache
                 uncached += 1
                 continue
             else:
-                # fav:-only query: match using an empty tag dict
+                # fav:/relation-only query: match using an empty tag dict
                 tags, rating = {}, None
         else:
             tags, rating = cached
         if _post_matches_query_with_favs(
-            tags, rating, pid, override_tags, favorite_ids
+            tags, rating, pid, override_tags, favorite_ids, relations_map.get(pid)
         ):
             matched.append(pid)
 
@@ -4684,6 +5079,15 @@ def api_stats():
         exhausted_count = conn.execute(
             "SELECT COUNT(*) FROM query_progress WHERE exhausted = 1"
         ).fetchone()[0]
+        rel_parent_count = conn.execute(
+            "SELECT COUNT(*) FROM post_relations WHERE parent_id IS NOT NULL"
+        ).fetchone()[0]
+        rel_child_count = conn.execute(
+            "SELECT COUNT(*) FROM post_relations WHERE children != ''"
+        ).fetchone()[0]
+        rel_pool_count = conn.execute(
+            "SELECT COUNT(*) FROM post_relations WHERE pools != ''"
+        ).fetchone()[0]
         primed_count = conn.execute(
             "SELECT COALESCE(SUM(new_posts_found), 0) FROM query_progress WHERE exhausted = 0 AND new_posts_found > 0"
         ).fetchone()[0]
@@ -4697,8 +5101,33 @@ def api_stats():
         "exhausted": exhausted_count,
         "primed": primed_count,
         "tags": tag_count,
+        "relations": {
+            "with_parent": rel_parent_count,
+            "with_children": rel_child_count,
+            "in_pool": rel_pool_count,
+        },
         "tag_graph": _tag_graph.info(),
         "tag_store": _tag_store.info(),
+    })
+
+
+@app.route("/api/relations/<int:post_id>")
+def api_relations(post_id):
+    """Stored parent/child/pool info for a post, plus ready-made searches.
+
+    Returns 404 if the post has never been looked up -- that's distinct from
+    a post known to have no relations, which returns nulls and empty lists.
+    """
+    rel = get_post_relations(post_id)
+    if rel is None:
+        return jsonify({"error": f"No relationship data for post {post_id}."}), 404
+    return jsonify({
+        "post_id": post_id,
+        "parent_id": rel["parent_id"],
+        "children": rel["children"],
+        "pools": rel["pools"],
+        "searches": relations_search_tags(post_id, rel),
+        "updated_at": rel["updated_at"],
     })
 
 
