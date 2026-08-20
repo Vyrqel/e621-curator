@@ -8,6 +8,8 @@ const els = {
   meta: $("meta"),
   metaQuery: $("meta-query"),
   metaLink: $("meta-link"),
+  relationsBlock: $("relations-block"),
+  relations: $("relations"),
   tagsArtists: $("tags-artists"),
   tagsCharacters: $("tags-characters"),
   btnNext: $("btn-next"),
@@ -298,6 +300,96 @@ async function fetchAndPreload() {
  * than the persistent seen table. History posts skip marking too — they're
  * already seen and we don't want to overwrite seen_at.
  */
+/**
+ * Render the parent / children / pool chips for a post.
+ *
+ * Each chip is a one-click jump to the search that reassembles that
+ * relationship, using the search strings the backend built:
+ *   parent post  -> child:<this post>    (walks up; resolved server-side)
+ *   siblings     -> parent:<parent_id>   (everything sharing that parent)
+ *   children     -> parent:<this post>   (walks down)
+ *   pool         -> pool:<pool_id>
+ *
+ * `child:<id>` is this app's own metatag, not e621's — the backend rewrites
+ * it into an `id:` search before the request goes out.
+ *
+ * Chips run as non-persisting overrides — these are one-off lookups and
+ * shouldn't write page progress into query_progress.
+ */
+function renderRelations(rel) {
+  const box = els.relations;
+  box.innerHTML = "";
+
+  if (!rel) {
+    els.relationsBlock.hidden = true;
+    return;
+  }
+
+  const chips = [];
+  if (rel.parent_id) {
+    chips.push({
+      kind: "parent",
+      text: `#${rel.parent_id}`,
+      search: rel.searches.parent,
+    });
+    chips.push({
+      kind: "siblings",
+      text: "family",
+      search: rel.searches.siblings,
+    });
+  }
+  if (rel.children && rel.children.length) {
+    chips.push({
+      kind: "children",
+      text: rel.children.length === 1
+        ? `#${rel.children[0]}`
+        : `${rel.children.length} posts`,
+      search: rel.searches.children,
+      title: rel.children.map((id) => `#${id}`).join(" "),
+    });
+  }
+  (rel.pools || []).forEach((poolId) => {
+    chips.push({
+      kind: "pool",
+      text: `#${poolId}`,
+      search: `pool:${poolId}`,
+    });
+  });
+
+  if (!chips.length) {
+    // Nothing to show, but the block staying visible-and-empty reads as a
+    // bug. Hide it; a standalone post is the common case.
+    els.relationsBlock.hidden = true;
+    return;
+  }
+
+  chips.forEach((chip) => {
+    const el = document.createElement("button");
+    el.className = "rel";
+    el.type = "button";
+    el.title = chip.title ? `${chip.search} — ${chip.title}` : chip.search;
+    const kind = document.createElement("span");
+    kind.className = "rel-kind";
+    kind.textContent = chip.kind;
+    const label = document.createElement("span");
+    label.textContent = chip.text;
+    el.append(kind, label);
+    el.addEventListener("click", () => jumpToSearch(chip.search));
+    box.appendChild(el);
+  });
+
+  els.relationsBlock.hidden = false;
+}
+
+/** Load a relation search into the override bar and fetch immediately. */
+function jumpToSearch(search) {
+  if (!search) return;
+  els.overrideInput.value = search;
+  els.overridePersist.checked = false;
+  updateOverrideUI();
+  fetchNext();
+}
+
 function renderPost(data) {
   current = data;
   els.image.src = data.sample_url;
@@ -313,6 +405,7 @@ function renderPost(data) {
   const primedSuffix = data.from_primed ? "  ★ new" : "";
   els.metaLink.textContent = `${prefix}#${data.id}${primedSuffix}`;
   els.metaLink.href = data.post_url;
+  renderRelations(data.relations);
   renderTags(els.tagsArtists, data.artists, "artist");
   renderTags(els.tagsCharacters, data.characters, "character");
   els.meta.hidden = false;
