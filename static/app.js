@@ -33,9 +33,14 @@ const els = {
   statPrimed: $("stat-primed"),
 };
 
+// How many posts ahead to keep fetched and image-preloaded.
+const PRELOAD_AHEAD = 5;
+
 let current = null;
-let buffer = null;        // The next post, prefetched and image-preloaded
-let bufferLoading = null; // Promise resolving when buffer is ready
+let bufferQueue = [];     // Upcoming posts, prefetched and image-preloaded (FIFO)
+let bufferFilling = null; // Promise resolving when the current fill pass is done
+let bufferFillBusy = false; // Reentrancy guard for the fill pass (see preloadNext)
+let bufferEpoch = 0;      // Bumped on invalidation so stale fills discard results
 let busy = false;
 let inHistory = false;    // True when we're stepping back through seen history
 
@@ -43,6 +48,11 @@ let inHistory = false;    // True when we're stepping back through seen history
 let reviewList = null;    // Array of post IDs, in chronological seen_at order
 let reviewIndex = 0;      // Current position in reviewList
 let reviewLoading = false; // True while building/rebuilding reviewList
+// post_id -> {data, img}. `img` is kept so the decoded bitmap stays alive.
+let reviewCache = new Map();
+let reviewFilling = null; // Promise for the in-flight review preload pass
+let reviewFillBusy = false; // Reentrancy guard for the review preload pass
+let reviewEpoch = 0;      // Bumped when the review list changes
 
 async function refreshStats() {
   try {
@@ -144,16 +154,12 @@ function buildNextUrl() {
     params.set("override", override);
     params.set("persist", els.overridePersist.checked ? "1" : "0");
   }
-  // Exclude the currently-buffered post so we don't double-serve it
-  if (buffer && buffer.id) {
-    params.set("exclude", String(buffer.id));
-  }
-  // Also exclude the current post (it might not be marked seen yet if
-  // mark-seen request is still in flight)
-  if (current && current.id) {
-    const existing = params.get("exclude");
-    params.set("exclude", existing ? `${existing},${current.id}` : String(current.id));
-  }
+  // Exclude everything already queued so we don't double-serve, plus the
+  // current post (its mark-seen request may still be in flight).
+  const exclude = [];
+  for (const p of bufferQueue) if (p && p.id) exclude.push(p.id);
+  if (current && current.id) exclude.push(current.id);
+  if (exclude.length) params.set("exclude", exclude.join(","));
   const qs = params.toString();
   return qs ? `/api/next?${qs}` : "/api/next";
 }
@@ -179,6 +185,9 @@ function updateReviewCounterUI() {
  */
 async function loadReviewList() {
   reviewLoading = true;
+  // The list is about to change, so anything preloaded against the old one
+  // is at best useless and at worst wrong.
+  invalidateReviewCache();
   els.reviewCountTotal.textContent = "…";
   els.reviewCounter.hidden = false;
 
@@ -256,14 +265,14 @@ function markSeen(postId) {
  * In review mode: fetches the post at reviewIndex from the loaded reviewList.
  * In normal mode: routes through /api/next with override/exclude params.
  */
-async function fetchAndPreload() {
+async function fetchAndPreload(reviewPostId = null) {
   try {
     let r;
     if (isReviewMode()) {
-      if (!reviewList || reviewList.length === 0) {
+      const postId = reviewPostId ?? (reviewList ? reviewList[reviewIndex] : null);
+      if (postId == null) {
         return { error: "Review list not loaded." };
       }
-      const postId = reviewList[reviewIndex];
       r = await fetch("/api/review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -275,15 +284,17 @@ async function fetchAndPreload() {
     const data = await r.json();
     if (!r.ok) return { error: data.error || "Unknown error" };
 
-    // Preload the image off-screen so it's ready when rendered
-    await new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = resolve;
-      img.onerror = () => reject(new Error("Failed to load image."));
-      img.src = data.sample_url;
+    // Preload the image off-screen so it's ready when rendered. The Image
+    // object is returned so callers can hold a reference, which keeps the
+    // decoded bitmap from being dropped before we render it.
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error("Failed to load image."));
+      im.src = data.sample_url;
     });
 
-    return { data };
+    return { data, img };
   } catch (e) {
     return { error: `Network error: ${e.message}` };
   }
@@ -402,22 +413,88 @@ function renderPost(data) {
 }
 
 /**
- * Kick off a background fetch for the next post, store it in `buffer`.
- * Safe to call concurrently — multiple calls share the same in-flight fetch.
+ * Top the buffer queue back up to PRELOAD_AHEAD posts.
+ *
+ * Fetches are sequential on purpose: each /api/next call excludes everything
+ * already queued, so a post has to land in the queue before the next request
+ * is built, or the server would hand us duplicates.
+ *
+ * Safe to call concurrently — callers share the one in-flight pass. A failed
+ * fetch ends the pass rather than storing an error; the foreground path will
+ * surface it if the user actually gets that far.
  */
 function preloadNext() {
-  if (bufferLoading) return bufferLoading;
-  bufferLoading = (async () => {
-    const result = await fetchAndPreload();
-    if (result.data) {
-      buffer = result.data;
-    } else {
-      // Don't store errors — let the foreground fetch surface them
-      buffer = null;
+  if (isReviewMode()) return preloadReviewAhead();
+  // The guard is a plain boolean, not `bufferFilling`. A pass that finds the
+  // queue already full never awaits, so its `finally` would run before the
+  // promise could be assigned — leaving a non-null `bufferFilling` behind and
+  // permanently blocking every later pass. The flag is set before the body
+  // runs, so it can't be out-ordered that way.
+  if (bufferFillBusy) return bufferFilling;
+  bufferFillBusy = true;
+  const epoch = bufferEpoch;
+  bufferFilling = (async () => {
+    try {
+      while (bufferQueue.length < PRELOAD_AHEAD) {
+        const result = await fetchAndPreload();
+        // The override changed (or we went back into history) mid-flight —
+        // this post was fetched under stale settings, so drop it.
+        if (epoch !== bufferEpoch) return;
+        if (!result.data) return;
+        bufferQueue.push(result.data);
+      }
+    } finally {
+      bufferFillBusy = false;
+      bufferFilling = null;
     }
-    bufferLoading = null;
   })();
-  return bufferLoading;
+  return bufferFilling;
+}
+
+/**
+ * Review mode's equivalent: keep the next PRELOAD_AHEAD entries of the
+ * review list fetched and image-preloaded in `reviewCache`.
+ *
+ * Also keeps a couple of entries behind the cursor, so stepping back one is
+ * instant too, and prunes anything outside that window to bound memory.
+ */
+function preloadReviewAhead() {
+  if (!isReviewMode() || !reviewList || reviewList.length === 0) return;
+  if (reviewFillBusy) return reviewFilling;  // see the note in preloadNext()
+  reviewFillBusy = true;
+  const epoch = reviewEpoch;
+
+  reviewFilling = (async () => {
+    try {
+      for (let n = 1; n <= PRELOAD_AHEAD; n++) {
+        const idx = reviewIndex + n;
+        if (idx >= reviewList.length) break;
+        const postId = reviewList[idx];
+        if (reviewCache.has(postId)) continue;
+        const result = await fetchAndPreload(postId);
+        if (epoch !== reviewEpoch) return;   // list changed under us
+        if (!result.data) continue;          // dead/deleted post — skip it
+        reviewCache.set(postId, { data: result.data, img: result.img });
+      }
+    } finally {
+      reviewFillBusy = false;
+      reviewFilling = null;
+      pruneReviewCache();
+    }
+  })();
+  return reviewFilling;
+}
+
+/** Drop cached review posts outside the window around the cursor. */
+function pruneReviewCache() {
+  if (!reviewList) { reviewCache.clear(); return; }
+  const keep = new Set();
+  for (let i = reviewIndex - 2; i <= reviewIndex + PRELOAD_AHEAD; i++) {
+    if (i >= 0 && i < reviewList.length) keep.add(reviewList[i]);
+  }
+  for (const id of reviewCache.keys()) {
+    if (!keep.has(id)) reviewCache.delete(id);
+  }
 }
 
 /**
@@ -431,14 +508,26 @@ async function reviewGoToIndex(targetIndex) {
   reviewIndex = clamped;
   updateReviewCounterUI();
 
+  const postId = reviewList[reviewIndex];
+  const cached = reviewCache.get(postId);
+  if (cached) {
+    // Already fetched and image-preloaded — render with no round trip.
+    renderPost(cached.data);
+    refreshStats();
+    preloadReviewAhead();
+    return;
+  }
+
   showLoading();
-  const result = await fetchAndPreload();
+  const result = await fetchAndPreload(postId);
   if (result.error) {
     showError(result.error);
     return;
   }
+  reviewCache.set(postId, { data: result.data, img: result.img });
   renderPost(result.data);
   refreshStats();
+  preloadReviewAhead();
 }
 
 async function fetchNext() {
@@ -489,21 +578,19 @@ async function fetchNext() {
       }
     }
 
-    // Normal forward navigation: use buffer if available
-    if (buffer) {
-      renderPost(buffer);
-      buffer = null;
+    // Normal forward navigation: take the head of the queue if we have one
+    if (bufferQueue.length) {
+      renderPost(bufferQueue.shift());
       refreshStats();
       preloadNext();
       return;
     }
 
-    if (bufferLoading) {
+    if (bufferFilling) {
       showLoading();
-      await bufferLoading;
-      if (buffer) {
-        renderPost(buffer);
-        buffer = null;
+      await bufferFilling;
+      if (bufferQueue.length) {
+        renderPost(bufferQueue.shift());
         refreshStats();
         preloadNext();
         return;
@@ -568,8 +655,9 @@ async function goBack() {
     inHistory = true;
     renderPost(data);
 
-    buffer = null;
-    bufferLoading = null;
+    // Stepping into history invalidates the forward queue: those posts were
+    // chosen relative to a different position in the stream.
+    invalidateBuffer();
   } finally {
     busy = false;
     els.btnBack.disabled = false;
@@ -602,7 +690,19 @@ async function toggleFavorite() {
 // Override input handlers — any change invalidates the buffer since it
 // may have been fetched under different settings.
 function invalidateBuffer() {
-  buffer = null;
+  bufferQueue = [];
+  bufferFilling = null;
+  bufferEpoch++;  // any fetch still in flight will discard its result
+  // bufferFillBusy is deliberately left alone: a pass may still be awaiting a
+  // response, and starting a second one alongside it would race. It clears
+  // itself, and the next navigation kicks off a fresh fill.
+}
+
+/** Same, for the review-mode cache — used when the review list changes. */
+function invalidateReviewCache() {
+  reviewCache = new Map();
+  reviewFilling = null;
+  reviewEpoch++;
 }
 
 function updateOverrideUI() {
@@ -845,6 +945,7 @@ els.reviewMode.addEventListener("change", async () => {
   } else {
     reviewList = null;
     reviewIndex = 0;
+    invalidateReviewCache();
     els.reviewCounter.hidden = true;
   }
 });
