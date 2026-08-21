@@ -1,7 +1,7 @@
 # blacklist.txt
 # e621-style blacklist. One clause per line.
-# Each line is a space-separated list of tags joined by AND.
-# Prefix a tag with `-` to negate (post must NOT have that tag).
+# Each line is a space-separated list of tags.
+# Prefix a tag with `-` to negate (post MUST have that tag).
 # `*` is a wildcard.
 # Lines starting with # are comments.
 #
