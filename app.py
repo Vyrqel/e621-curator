@@ -379,6 +379,24 @@ CREATE TABLE IF NOT EXISTS seen (
     seen_at INTEGER NOT NULL
 );
 
+-- Posts handed to the client's preload buffer but not yet displayed.
+--
+-- This is the durable half of the seen/reserved split. `seen` means "the user
+-- looked at it"; this table means "we committed it to a buffer and owe the
+-- user a look at it." Keeping the two apart is what stops pagination
+-- bookkeeping writing off a page on the strength of a post nobody saw.
+--
+-- Rows leave by exactly two doors: /api/seen deletes on display, and the
+-- drain in _drain_reserved deletes when a post is re-served after the client
+-- dropped it (reload, override change, closed tab). Nothing expires on a
+-- timer — an abandoned row is the whole point, it is a post we still owe.
+CREATE TABLE IF NOT EXISTS preload_queue (
+    post_id INTEGER PRIMARY KEY,
+    query_tags TEXT,                    -- query it came from, for /api/seen accounting
+    from_primed INTEGER NOT NULL DEFAULT 0,
+    reserved_at INTEGER NOT NULL        -- ordering: oldest reservation resumes first
+);
+
 CREATE TABLE IF NOT EXISTS favorites (
     post_id INTEGER PRIMARY KEY,
     favorited_at INTEGER NOT NULL
@@ -1025,6 +1043,71 @@ def e621_unfavorite(post_id):
 def get_seen_ids():
     with db() as conn:
         return {row["post_id"] for row in conn.execute("SELECT post_id FROM seen")}
+
+
+# ---------- Preload reservations ----------
+#
+# The client keeps N posts prefetched. Those posts are spoken for but unseen,
+# and the distinction is load-bearing: treat them as seen and pagination walks
+# past pages that still owe content; treat them as unseen and available and
+# they get served twice. So they live in their own table.
+#
+# The client still sends `exclude` on every request. That is not redundant
+# with this table — the two answer different questions:
+#
+#   preload_queue  = "posts we owe the user a look at"   (durable, server-side)
+#   exclude        = "posts I am still holding right now" (live, client-side)
+#
+# A row in the table but NOT in exclude is an abandoned reservation: the
+# client dropped it without displaying it. Those are exactly the posts to
+# re-serve first, which is what makes the queue resume across a reload.
+
+
+def reserve_posts(entries):
+    """Record posts handed to the preload buffer. `entries` is [(id, query, primed)]."""
+    if not entries:
+        return
+    now = int(time.time())
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO preload_queue (post_id, query_tags, from_primed, reserved_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(post_id) DO NOTHING",
+            [(pid, q, 1 if primed else 0, now) for pid, q, primed in entries],
+        )
+
+
+def release_post(post_id):
+    """Drop a reservation — the post has been displayed, or re-served."""
+    with db() as conn:
+        conn.execute("DELETE FROM preload_queue WHERE post_id = ?", (post_id,))
+
+
+def get_reserved_ids():
+    with db() as conn:
+        return {r["post_id"] for r in conn.execute("SELECT post_id FROM preload_queue")}
+
+
+def take_abandoned_reservation(holding, seen):
+    """Pop the oldest reservation the client is no longer holding.
+
+    Returns (post_id, query_tags, from_primed) or None. Rows for posts that
+    turned out to be seen anyway are cleaned up in passing rather than
+    returned — that can happen if /api/seen raced the reservation.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT post_id, query_tags, from_primed FROM preload_queue "
+            "ORDER BY reserved_at ASC"
+        ).fetchall()
+    for row in rows:
+        pid = row["post_id"]
+        if pid in holding:
+            continue  # client still has it buffered; leave it reserved
+        if pid in seen:
+            release_post(pid)
+            continue
+        return pid, row["query_tags"], bool(row["from_primed"])
+    return None
 
 
 def query_hash(tags):
@@ -4727,16 +4810,49 @@ def api_next():
     # `reserved` note in _find_unseen_post. Folding them into `seen` would
     # make a page look fully-exhausted on the strength of posts the user may
     # never actually look at, and last_page would step over them for good.
-    reserved = set()
+    # What the client is holding in its buffer *right now*.
+    holding = set()
     exclude_param = request.args.get("exclude", "")
     if exclude_param:
         for tok in exclude_param.split(","):
             tok = tok.strip()
             if tok.isdigit():
-                reserved.add(int(tok))
+                holding.add(int(tok))
+
+    # Everything we owe the user a look at: the durable reservations plus
+    # whatever this client is holding. Deliberately kept out of `seen` — see
+    # the `reserved` note in _find_unseen_post.
+    reserved = get_reserved_ids() | holding
 
     known = load_known_tags()
     blacklist = load_blacklist()
+
+    # Resume the queue before picking anything new. An abandoned reservation
+    # is a post we already committed to showing and never did; serving it now
+    # is what makes the buffer survive a reload or a closed tab.
+    if not override:
+        resumed = take_abandoned_reservation(holding, seen)
+        if resumed is not None:
+            post_id, res_query, res_primed = resumed
+            try:
+                post = _fetch_post_by_id(post_id)
+            except requests.RequestException as e:
+                log.warning(f"Reserved post {post_id} refetch failed: {e}")
+                post = None
+            if post is None:
+                # Gone from e621 — the debt is uncollectable, drop it.
+                log.info(f"Reserved post {post_id} no longer exists; releasing.")
+                release_post(post_id)
+            elif is_blacklisted(post, blacklist) or not post_is_viewable(post):
+                log.info(f"Reserved post {post_id} no longer eligible; releasing.")
+                release_post(post_id)
+            else:
+                log.info(f"Resuming abandoned reservation: post {post_id}.")
+                response = _build_post_response(
+                    post, res_query or "(resumed)", known, from_primed=res_primed
+                )
+                reserve_posts([(post_id, res_query, res_primed)])  # still owed
+                return jsonify(response)
 
     # Try primed queries first
     if primed_pool:
@@ -4746,7 +4862,7 @@ def api_next():
             ordered=True, reserved=reserved
         )
         if response is not None:
-            return jsonify(response)
+            return jsonify(_reserve_served(response, persist_reservation=not override))
         log.info(
             "Primed pool yielded nothing this attempt; falling back to general pool."
         )
@@ -4757,11 +4873,26 @@ def api_next():
         reserved=reserved
     )
     if response is not None:
-        return jsonify(response)
+        return jsonify(_reserve_served(response, persist_reservation=not override))
 
     return jsonify({
         "error": "All sampled queries returned only seen or blacklisted posts. Try again or add queries."
     }), 404
+
+
+def _reserve_served(response, persist_reservation=True):
+    """Record a post we just handed out as owed, and pass the response through.
+
+    Override queries are ephemeral — they never write query_progress, so there
+    is no bookkeeping for an unseen post to corrupt and nothing to resume.
+    """
+    if persist_reservation and response.get("id"):
+        reserve_posts([(
+            response["id"],
+            response.get("query"),
+            response.get("from_primed", False),
+        )])
+    return response
 
 
 @app.route("/api/seen", methods=["POST"])
@@ -4775,6 +4906,7 @@ def api_seen():
     if not post_id:
         return jsonify({"error": "Missing post_id"}), 400
     mark_post_seen(post_id)
+    release_post(post_id)  # debt settled: it's seen, not merely owed
     if from_primed and query:
         decrement_primed_count(query)
     return jsonify({"ok": True})
@@ -5186,6 +5318,11 @@ def api_stats():
         "blacklist": len(load_blacklist()),
         "exhausted": exhausted_count,
         "primed": primed_count,
+        # Outstanding preload reservations — posts handed to a buffer and not
+        # yet displayed. Healthy steady state is roughly the buffer depth;
+        # a number that climbs and never falls means rows aren't being
+        # released and the queue is leaking.
+        "reserved": len(get_reserved_ids()),
         "tags": tag_count,
         "relations": {
             "with_parent": rel_parent_count,
