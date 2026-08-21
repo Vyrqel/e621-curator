@@ -1857,11 +1857,18 @@ def start_maintenance(first=False):
 # ---------- Routes ----------
 
 
-def _find_unseen_post(query, seen, blacklist, persist=True):
+def _find_unseen_post(query, seen, blacklist, persist=True, reserved=None):
     """Two-phase page strategy for one query.
 
     When persist=False, skip all writes to query_progress (no last_page tracking,
     no exhaustion marking). Used for ephemeral override queries.
+
+    `reserved` holds post IDs the client already has buffered but has NOT
+    displayed yet. They must not be served twice, but they are emphatically
+    NOT seen: a page whose only unseen post is reserved is still a page with
+    content on it, and advancing last_page past it would drop that post for
+    good if the client never displays it. So reserved IDs suppress *serving*
+    while leaving the page-fullness judgement alone.
 
     Semantics: `last_page` records the highest page known to be FULLY seen.
     Phase 2 resumes from `last_page + 1` (everything below is already exhausted).
@@ -1876,10 +1883,19 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
     Returns (post, page) on success, or None if the query is exhausted.
     """
 
+    reserved = reserved or set()
+
     def unseen_on_page(page):
+        """Returns (posts, eligible, servable).
+
+        `eligible` drives progress bookkeeping — it is the honest answer to
+        "does this page still hold anything the user hasn't seen?"
+        `servable` is `eligible` minus the reserved buffer, and is the only
+        thing we may hand back.
+        """
         posts = fetch_posts(query, page=page)
         if not posts:
-            return None, []  # past end of results
+            return None, [], []  # past end of results
         eligible = [
             p
             for p in posts
@@ -1887,7 +1903,8 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
             and not is_blacklisted(p, blacklist)
             and post_is_viewable(p)
         ]
-        return posts, eligible
+        servable = [p for p in eligible if p["id"] not in reserved]
+        return posts, eligible, servable
 
     # Page 1 freshness cache: if the scanner or a prior request recently
     # confirmed page 1 has no eligible posts, skip the redundant fetch.
@@ -1917,7 +1934,7 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
 
         # Phase 1: check page 1 for new posts
         if not skip_phase1:
-            posts, eligible = unseen_on_page(1)
+            posts, eligible, servable = unseen_on_page(1)
             if posts is None:
                 log.info(f"Query '{query}' page 1 returned no posts at all.")
                 return None
@@ -1925,10 +1942,19 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
                 # Page 1 has fresh content — clear the empty cache
                 if persist:
                     set_page1_empty(query, None)
-                return random.choice(eligible), 1
-            # Page 1 fully seen — cache that fact
-            if persist:
-                set_page1_empty(query, int(time.time()))
+                if servable:
+                    return random.choice(servable), 1
+                # Everything new on page 1 is already in the client's buffer.
+                # Page 1 is NOT empty, so the cache stays cleared above; fall
+                # through to phase 2 for something else to show.
+                log.info(
+                    f"Query '{query}' page 1 unseen posts are all buffered; "
+                    f"falling through to phase 2."
+                )
+            else:
+                # Page 1 fully seen — cache that fact
+                if persist:
+                    set_page1_empty(query, int(time.time()))
 
         # Phase 2: walk forward from last_page + 1.
         if persist:
@@ -1940,16 +1966,39 @@ def _find_unseen_post(query, seen, blacklist, persist=True):
             f"(persist={persist}, phase1_skipped={skip_phase1})"
         )
         page = resume_page
+        # Set if we step over a page that had unseen posts we couldn't serve
+        # because the client already holds them. Running off the end of the
+        # results after that does NOT mean the query is exhausted — it means
+        # what's left is in the buffer — so the exhausted flag must not be set.
+        skipped_reserved = False
         while True:
-            posts, eligible = unseen_on_page(page)
+            posts, eligible, servable = unseen_on_page(page)
             if posts is None:
+                if skipped_reserved:
+                    log.info(
+                        f"Query '{query}' has no servable posts left, but its "
+                        f"remaining unseen posts are buffered — not marking "
+                        f"exhausted."
+                    )
+                    return None
                 log.info(f"Query '{query}' exhausted (last attempted page: {page}).")
                 if persist:
                     mark_exhausted(query)
                 return None
             if eligible:
-                log.info(f"Query '{query}' found unseen post on page {page}.")
-                return random.choice(eligible), page
+                if servable:
+                    log.info(f"Query '{query}' found unseen post on page {page}.")
+                    return random.choice(servable), page
+                # Unseen content here, but it's all sitting in the client's
+                # buffer. Step over the page WITHOUT advancing last_page, so
+                # these posts stay reachable if they're never displayed.
+                log.info(
+                    f"Query '{query}' page {page} unseen posts are all buffered; "
+                    f"skipping without advancing last_page."
+                )
+                skipped_reserved = True
+                page += 1
+                continue
             log.info(
                 f"Query '{query}' page {page} fully seen ({len(posts)} posts); "
                 f"{'advancing last_page and ' if persist else ''}continuing."
@@ -4568,7 +4617,8 @@ def _build_post_response(post, query, known, from_primed):
     }
 
 
-def _try_pool(pool, seen, blacklist, persist, known, from_primed, ordered=False):
+def _try_pool(pool, seen, blacklist, persist, known, from_primed, ordered=False,
+              reserved=None):
     """Sample queries from a pool; return response dict or None.
 
     ordered=False (general pool): pick up to 5 queries at RANDOM.
@@ -4581,7 +4631,9 @@ def _try_pool(pool, seen, blacklist, persist, known, from_primed, ordered=False)
     """
     if ordered:
         for query in pool[:MAX_PRIMED_ATTEMPTS]:
-            result = _find_unseen_post(query, seen, blacklist, persist=persist)
+            result = _find_unseen_post(
+                query, seen, blacklist, persist=persist, reserved=reserved
+            )
             if result is not None:
                 post, page = result
                 return _build_post_response(post, query, known, from_primed)
@@ -4593,7 +4645,9 @@ def _try_pool(pool, seen, blacklist, persist, known, from_primed, ordered=False)
         if query in tried:
             continue
         tried.add(query)
-        result = _find_unseen_post(query, seen, blacklist, persist=persist)
+        result = _find_unseen_post(
+            query, seen, blacklist, persist=persist, reserved=reserved
+        )
         if result is not None:
             post, page = result
             return _build_post_response(post, query, known, from_primed)
@@ -4668,14 +4722,18 @@ def api_next():
         }), 400
 
     seen = get_seen_ids()
-    # Allow caller to exclude additional IDs (e.g. a post they've already
-    # buffered but not yet marked seen — prevents serving the same post twice)
+    # Posts the caller already holds in its preload buffer but has not
+    # displayed yet. These are kept OUT of `seen` deliberately — see the
+    # `reserved` note in _find_unseen_post. Folding them into `seen` would
+    # make a page look fully-exhausted on the strength of posts the user may
+    # never actually look at, and last_page would step over them for good.
+    reserved = set()
     exclude_param = request.args.get("exclude", "")
     if exclude_param:
         for tok in exclude_param.split(","):
             tok = tok.strip()
             if tok.isdigit():
-                seen.add(int(tok))
+                reserved.add(int(tok))
 
     known = load_known_tags()
     blacklist = load_blacklist()
@@ -4684,7 +4742,8 @@ def api_next():
     if primed_pool:
         log.info(f"Primed pool active: {len(primed_pool)} querie(s) with new content.")
         response = _try_pool(
-            primed_pool, seen, blacklist, persist, known, from_primed=True, ordered=True
+            primed_pool, seen, blacklist, persist, known, from_primed=True,
+            ordered=True, reserved=reserved
         )
         if response is not None:
             return jsonify(response)
@@ -4693,7 +4752,10 @@ def api_next():
         )
 
     # Fall back to the general pool
-    response = _try_pool(queries, seen, blacklist, persist, known, from_primed=False)
+    response = _try_pool(
+        queries, seen, blacklist, persist, known, from_primed=False,
+        reserved=reserved
+    )
     if response is not None:
         return jsonify(response)
 
