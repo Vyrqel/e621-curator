@@ -853,6 +853,71 @@ def reconcile_additions_files():
         )
 
 
+def sync_additions_files():
+    """Push the two additions files into the DB and queries.txt.
+
+    Direction is file -> everything else; the files are the source of truth.
+
+      * additions table: replaced wholesale with the file contents, so a tag
+        deleted from a file by hand disappears from the DB too (this is the
+        handle for undoing accidental additions without the sqlite CLI).
+        `added_at` is preserved for tags that survive the replace.
+      * queries.txt: additive only. Any tag not already present as a bare
+        positive tag in an existing query gets appended; nothing is removed
+        or rewritten.
+
+    Returns a dict summary.
+    """
+    file_tags = []  # [(tag, category)] in file order, artists first
+    seen = set()
+    for category in ("artist", "character"):
+        for tag in sorted(read_additions_file(category)):
+            if tag in seen:
+                continue
+            seen.add(tag)
+            file_tags.append((tag, category))
+
+    now = int(time.time())
+    with db() as conn:
+        old = {
+            row["tag"]: row["added_at"]
+            for row in conn.execute("SELECT tag, added_at FROM additions")
+        }
+        conn.execute("DELETE FROM additions")
+        conn.executemany(
+            "INSERT INTO additions (tag, category, added_at) VALUES (?, ?, ?)",
+            [(tag, cat, old.get(tag, now)) for tag, cat in file_tags],
+        )
+    db_removed = len(set(old) - seen)
+    db_added = len(seen - set(old))
+
+    # queries.txt — additive only
+    existing = set()
+    for query in load_queries():
+        for token in query.split():
+            token = token.strip().lower()
+            if token and not token.startswith("-") and ":" not in token:
+                existing.add(token)
+        existing.add(query.strip().lower())
+
+    new_lines = [tag for tag, _ in file_tags if tag not in existing]
+    if new_lines:
+        if QUERIES_FILE.exists():
+            current = QUERIES_FILE.read_text(encoding="utf-8")
+        else:
+            current = "# queries.txt\n"
+        if current and not current.endswith("\n"):
+            current += "\n"
+        QUERIES_FILE.write_text(current + "\n".join(new_lines) + "\n", encoding="utf-8")
+
+    return {
+        "db_rows": len(file_tags),
+        "db_added": db_added,
+        "db_removed": db_removed,
+        "queries_added": len(new_lines),
+    }
+
+
 def _tag_matches(pattern, post_tags):
     """Check if any tag in post_tags matches the pattern. Supports `*` wildcard."""
     if "*" not in pattern:
@@ -1695,7 +1760,7 @@ def run_export_diff():
     expunge = []
     skipped = 0
     for tags, _last in tqdm(
-        rows, desc="Export diff: compare", unit="tag", leave=False
+        rows, desc="Export diff: compare", unit="tag", leave=False, **TQDM_STEADY
     ):
         count = lookup_post_count(tags)
         if count is None:
@@ -1717,7 +1782,7 @@ def run_export_diff():
 
     expunged = 0
     for tags in tqdm(
-        expunge, desc="Export diff: expunge", unit="tag", leave=False
+        expunge, desc="Export diff: expunge", unit="tag", leave=False, **TQDM_STEADY
     ):
         if confirm_tag_is_empty(tags):
             expunge_empty_tag(tags)
@@ -1731,7 +1796,11 @@ def run_export_diff():
             seen = get_seen_ids()
             blacklist = load_blacklist()
             for tags, count in tqdm(
-                dirty, desc="Export diff: scan", unit="tag", leave=False
+                dirty,
+                desc="Export diff: scan",
+                unit="tag",
+                leave=False,
+                **TQDM_STEADY,
             ):
                 _scan_one_query(tags, seen, blacklist)
                 _purge_deleted_for_tag(tags)
@@ -1794,6 +1863,7 @@ def _scan_exhausted_queries():
             desc="Scanner: rescan",
             unit="batch",
             leave=False,
+            **TQDM_STEADY,
         ):
             _scan_batch(tags_list[i : i + RESCAN_BATCH_TAGS], seen, blacklist)
     finally:
@@ -1832,21 +1902,28 @@ def _enumerate_e621_favorites():
     query = f"fav:{E621_USERNAME}"
     all_ids = set()
     page = 1
-    # Total is unknown up front (the API gives no favorite count), so the bar
-    # runs open-ended and just counts posts as pages come in.
-    with tqdm(desc="Favorites sync: fetch", unit="post", leave=False) as bar:
+    # Total is unknown up front, so the bar runs open-ended. Each page is
+    # assumed full while in flight and corrected on arrival, which lets the
+    # same easing curve that drives the tag sweeps drive this too.
+    bar = _SmoothBar(None, "Favorites sync: fetch")
+    try:
         while True:
+            bar.batch_start(POSTS_PER_PAGE)
             try:
                 posts = fetch_posts(query, page=page)
             except requests.RequestException as e:
                 log.warning(f"Favorites sync: error on page {page}: {e}")
+                bar.batch_end(0)
                 break
             if not posts:
+                bar.batch_end(0)
                 break
             for p in posts:
                 all_ids.add(p["id"])
-            bar.update(len(posts))
+            bar.batch_end(len(posts))
             page += 1
+    finally:
+        bar.close()
 
     log.info(f"Favorites sync: found {len(all_ids)} favorites on e621.")
     return all_ids
@@ -2183,7 +2260,9 @@ def set_post_tag_cache(post_id, tags_dict, rating):
 
 def _csv_ids(values):
     """Normalise an ID list into the stored comma-separated form."""
-    out = sorted({int(v) for v in (values or []) if str(v).strip().isdigit() or isinstance(v, int)})
+    out = sorted({
+        int(v) for v in (values or []) if str(v).strip().isdigit() or isinstance(v, int)
+    })
     return ",".join(str(v) for v in out)
 
 
@@ -2531,6 +2610,19 @@ def clear_refresh_progress():
         conn.execute("DELETE FROM refresh_progress WHERE id = 1")
 
 
+# Shared tqdm settings for the per-item bars (rescan, export diff, dict
+# retrain, downloads). tqdm's default `miniters=None` turns on
+# dynamic_miniters: after each repaint it sets miniters to however many units
+# went by since the last one, so a fast loop teaches it to skip ever-larger
+# chunks and the bar lurches instead of moving. Pinning miniters=1 disables
+# that; mininterval still throttles repaints to 10/s by time, which is the
+# right knob for a bar stepped per item.
+TQDM_STEADY = {"miniters": 1, "mininterval": 0.1}
+
+# Streaming-download read size. Doubles as the progress-bar resolution.
+DOWNLOAD_CHUNK = 1 << 16  # 64 KiB
+
+
 class _SmoothBar:
     """A tqdm bar counting posts, driven by an easing curve between batches.
 
@@ -2559,7 +2651,7 @@ class _SmoothBar:
     batch that hasn't landed.
     """
 
-    TICK = 0.05  # seconds between display updates
+    TICK = 0.1  # seconds between display updates (10 FPS)
     ALPHA = 0.3  # EMA weight on the newest batch's observed rate
     REACH = 3.0  # tau divisor: ~95% of the way at the expected duration
     OVERRUN = 1.25  # velocity ceiling, as a multiple of the estimated pace
@@ -2586,6 +2678,16 @@ class _SmoothBar:
             leave=False,
             smoothing=0,
             initial=initial,
+            # Both of these matter. Left at its default, tqdm turns on
+            # dynamic_miniters: after every repaint it sets `miniters` to
+            # however many units went by since the last one, so a bar updated
+            # in small steps faster than `mininterval` teaches tqdm to skip
+            # ever-larger chunks — the easing curve runs, and the terminal
+            # only sees it when a batch lands. Pinning miniters=1 and
+            # mininterval=0 makes every update() we issue repaint, which is
+            # the whole point of driving the bar off a ticker.
+            miniters=1,
+            mininterval=0,
         )
         self.ticker = threading.Thread(target=self._tick, daemon=True)
         self.ticker.start()
@@ -2596,12 +2698,16 @@ class _SmoothBar:
             now = time.monotonic()
             dt, last = now - last, now
             with self.lock:
-                if not self.pending:
-                    continue
                 remaining = (self.actual + self.pending) - self.shown
                 if remaining <= 0:
                     continue
-                velocity = min(remaining / self.tau, self.cap)
+                # Keep easing between batches too. Once a batch lands there is
+                # usually a little residual the curve hadn't covered, plus a
+                # gap while the DB writes and any 404 verification happen; if
+                # the tick stopped there the bar would freeze and then resume
+                # with a visible step. Easing straight through the gap absorbs
+                # the residual as continued motion instead.
+                velocity = min(remaining / self.tau, self.cap or remaining)
                 self._draw(self.shown + velocity * dt)
 
     def _draw(self, target):
@@ -2611,7 +2717,9 @@ class _SmoothBar:
         but the bar itself is only ever advanced in whole posts — tqdm would
         otherwise render a fractional count.
         """
-        ceiling = min(self.total, self.actual + self.pending)
+        ceiling = self.actual + self.pending
+        if self.total is not None:
+            ceiling = min(self.total, ceiling)
         self.shown = max(self.shown, min(target, ceiling))
         whole = int(self.shown)
         if whole > self.bar.n:
@@ -2626,8 +2734,12 @@ class _SmoothBar:
             self.tau = max(expected / self.REACH, 0.05)
             self.cap = (posts / expected) * self.OVERRUN
 
-    def batch_end(self):
+    def batch_end(self, posts=None):
         """Retire the in-flight batch and refold its pace into the estimate.
+
+        `posts`, if given, replaces the size declared at `batch_start` — for
+        callers that can only guess the batch size up front (an open-ended
+        page walk, where the last page comes back short).
 
         Called after the batch is fully processed — including any one-by-one
         404 verification — so the rate reflects real wall-clock progress per
@@ -2637,6 +2749,8 @@ class _SmoothBar:
         with self.lock:
             if not self.pending:
                 return
+            if posts is not None:
+                self.pending = posts
             elapsed = time.monotonic() - self.started
             if elapsed > 0:
                 observed = self.pending / elapsed
@@ -2647,16 +2761,44 @@ class _SmoothBar:
                 )
             self.actual += self.pending
             self.pending = 0
+            # A corrected batch can come back smaller than the curve already
+            # drew against. The display never walks backwards, so just drop
+            # the float back to reality and let the next batch's motion pick
+            # up once it passes what's already on screen.
+            self.shown = min(self.shown, float(self.actual))
             # Deliberately no catch-up draw here — whatever the curve hadn't
             # covered becomes the next batch's starting point.
 
+    CLOSE_EASE = 0.5  # seconds allowed to walk the last residual in
+
     def close(self):
+        """Stop the ticker and walk the display in to the real count.
+
+        Whatever the last batch's curve didn't cover is eased in over at most
+        CLOSE_EASE seconds rather than assigned, so the bar's final move looks
+        like the rest of its motion instead of a snap to the end.
+        """
         self.done.set()
         self.ticker.join(timeout=1)
+        deadline = time.monotonic() + self.CLOSE_EASE
+        while True:
+            with self.lock:
+                self.pending = 0
+                remaining = self.actual - self.shown
+                if remaining <= 0 or time.monotonic() >= deadline:
+                    break
+                # Linear over the remaining budget, so it lands on time.
+                budget = max(deadline - time.monotonic(), self.TICK)
+                self._draw(self.shown + remaining * (self.TICK / budget))
+            time.sleep(self.TICK)
         with self.lock:
-            self.pending = 0
-            self.shown = float(self.actual)
-            self.bar.n = self.actual
+            # Forward-only. On an open-ended bar the last page can come back
+            # shorter than the full page assumed while it was in flight, so
+            # the curve may already sit past the real count; rewinding the
+            # display to correct it would be the exact snap this class exists
+            # to avoid. The log line carries the true number.
+            self.shown = max(self.shown, float(self.actual))
+            self.bar.n = max(self.bar.n, self.actual)
             self.bar.refresh()
             self.bar.close()
 
@@ -2941,7 +3083,13 @@ def retrain_tag_dict():
         payloads = {}
         old_bytes = 0
         errors = 0
-        for r in tqdm(rows, desc="Dict retrain: decode", unit="blob", leave=False):
+        for r in tqdm(
+            rows,
+            desc="Dict retrain: decode",
+            unit="blob",
+            leave=False,
+            **TQDM_STEADY,
+        ):
             blob = bytes(r["tags_blob"])
             old_bytes += len(blob)
             try:
@@ -2998,6 +3146,7 @@ def retrain_tag_dict():
                 desc="Dict retrain: recompress",
                 unit="blob",
                 leave=False,
+                **TQDM_STEADY,
             )
         ]
 
@@ -3845,9 +3994,16 @@ def _download_dump(url, dest):
                     unit_scale=True,
                     unit_divisor=1024,
                     leave=False,
+                    **TQDM_STEADY,
                 ) as bar,
             ):
-                for chunk in response.iter_content(1 << 20):
+                # 64 KiB, not 1 MiB. The bar can only move when a chunk
+                # lands, so the chunk size *is* the resolution of the bar —
+                # at 1 MiB it stepped a megabyte at a time no matter what
+                # tqdm was told. This is still far larger than the socket
+                # read, so the write count barely changes; tqdm's mininterval
+                # caps the repaints at 10/s regardless of how many arrive.
+                for chunk in response.iter_content(DOWNLOAD_CHUNK):
                     handle.write(chunk)
                     bar.update(len(chunk))
         if dest.exists() and dest.stat().st_size:
@@ -3991,6 +4147,7 @@ def _export_stream(path, desc):
             unit_scale=True,
             unit_divisor=1024,
             leave=False,
+            **TQDM_STEADY,
         ) as bar:
 
             def tick():
@@ -4639,11 +4796,16 @@ def _relations_payload(post):
     pid = post["id"]
     if "relationships" in post or "pools" in post:
         parent_id, children, pools = extract_relations(post)
-        rel = {"parent_id": parent_id, "children": sorted(set(children)),
-               "pools": sorted(set(pools))}
+        rel = {
+            "parent_id": parent_id,
+            "children": sorted(set(children)),
+            "pools": sorted(set(pools)),
+        }
     else:
         rel = get_post_relations(pid) or {
-            "parent_id": None, "children": [], "pools": []
+            "parent_id": None,
+            "children": [],
+            "pools": [],
         }
     return {
         "parent_id": rel["parent_id"],
@@ -4700,8 +4862,9 @@ def _build_post_response(post, query, known, from_primed):
     }
 
 
-def _try_pool(pool, seen, blacklist, persist, known, from_primed, ordered=False,
-              reserved=None):
+def _try_pool(
+    pool, seen, blacklist, persist, known, from_primed, ordered=False, reserved=None
+):
     """Sample queries from a pool; return response dict or None.
 
     ordered=False (general pool): pick up to 5 queries at RANDOM.
@@ -4858,8 +5021,14 @@ def api_next():
     if primed_pool:
         log.info(f"Primed pool active: {len(primed_pool)} querie(s) with new content.")
         response = _try_pool(
-            primed_pool, seen, blacklist, persist, known, from_primed=True,
-            ordered=True, reserved=reserved
+            primed_pool,
+            seen,
+            blacklist,
+            persist,
+            known,
+            from_primed=True,
+            ordered=True,
+            reserved=reserved,
         )
         if response is not None:
             return jsonify(_reserve_served(response, persist_reservation=not override))
@@ -4869,8 +5038,7 @@ def api_next():
 
     # Fall back to the general pool
     response = _try_pool(
-        queries, seen, blacklist, persist, known, from_primed=False,
-        reserved=reserved
+        queries, seen, blacklist, persist, known, from_primed=False, reserved=reserved
     )
     if response is not None:
         return jsonify(_reserve_served(response, persist_reservation=not override))
@@ -4887,11 +5055,13 @@ def _reserve_served(response, persist_reservation=True):
     is no bookkeeping for an unseen post to corrupt and nothing to resume.
     """
     if persist_reservation and response.get("id"):
-        reserve_posts([(
-            response["id"],
-            response.get("query"),
-            response.get("from_primed", False),
-        )])
+        reserve_posts([
+            (
+                response["id"],
+                response.get("query"),
+                response.get("from_primed", False),
+            )
+        ])
     return response
 
 
@@ -5614,6 +5784,14 @@ if __name__ == "__main__":
         "two halves are always run together — the retrain re-reduces tags "
         "using the graph, so it only means anything after a refresh.",
     )
+    parser.add_argument(
+        "--sync-additions",
+        action="store_true",
+        help="Push the two additions files into the DB (replacing the "
+        "additions table wholesale, so hand-deleted entries go away) and "
+        "append any tags missing from queries.txt, then exit. queries.txt is "
+        "only added to, never rewritten.",
+    )
     args = parser.parse_args()
     DICT_TRAIN_SAMPLES = max(0, args.dict_samples)
 
@@ -5627,6 +5805,16 @@ if __name__ == "__main__":
     if args.vacuum:
         init_db()
         run_vacuum()
+        raise SystemExit(0)
+
+    if args.sync_additions:
+        init_db()
+        result = sync_additions_files()
+        log.info(
+            f"Additions sync: additions table now {result['db_rows']} row(s) "
+            f"(+{result['db_added']}, -{result['db_removed']}); "
+            f"{result['queries_added']} tag(s) appended to queries.txt"
+        )
         raise SystemExit(0)
 
     if args.rebuild_tag_data:
