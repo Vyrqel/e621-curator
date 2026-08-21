@@ -44,6 +44,10 @@ from helpers.tagcache import (
 from helpers.taggraph import start_tag_graph_sync
 from helpers.userfiles import reconcile_additions_files, sync_additions_files
 
+# Imported for its side effects: importing the module is what registers the
+# routes on `app`. Without it the server starts and 404s on every path.
+from helpers import web  # noqa: F401  isort:skip
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="e6 curator — backlog management tool")
     parser.add_argument(
