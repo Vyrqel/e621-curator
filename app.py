@@ -1377,15 +1377,6 @@ def decrement_primed_count(tags):
         )
 
 
-def clear_primed(tags):
-    """Clear the new_posts_found counter after a primed query is served from."""
-    with db() as conn:
-        conn.execute(
-            "UPDATE query_progress SET new_posts_found = 0 WHERE query_hash = ?",
-            (query_hash(tags),),
-        )
-
-
 def purge_damaging_query_data():
     """Maintenance: remove/repair potentially damaging query_progress rows."""
 
@@ -2214,22 +2205,6 @@ def mark_post_seen(post_id):
 # review-mode filter matching. The only staleness window in practice is "a
 # post whose tags changed on e621 between when we last displayed it and now,"
 # which is rare and self-corrects on the next display.
-
-
-def get_post_tag_cache(post_id):
-    """Return (tags_dict, rating, cached_at) for a post, or None if not cached."""
-    with db() as conn:
-        row = conn.execute(
-            "SELECT tags_blob, cached_at FROM post_tags WHERE post_id = ?",
-            (post_id,),
-        ).fetchone()
-    if not row:
-        return None
-    try:
-        tags_dict, rating = decode_tags(bytes(row["tags_blob"]))
-    except Exception:
-        return None
-    return (tags_dict, rating, row["cached_at"])
 
 
 def set_post_tag_cache(post_id, tags_dict, rating):
@@ -3410,11 +3385,6 @@ class _TagGraph:
         frozen = frozenset(out)
         self._ancestors[tag] = frozen
         return frozen
-
-    def ancestors(self, tag):
-        with self.lock:
-            self._ensure_loaded_locked()
-            return self._ancestors_locked(tag)
 
     def expand(self, tags):
         """Return `tags` plus everything they transitively imply.
@@ -4765,27 +4735,6 @@ def _post_matches_query_with_favs(
     return True
 
 
-def post_matches_query(tags_dict, rating, post_id, query):
-    """Check if a post matches an e621-style query string.
-
-    Supports positive/negated tags, rating:s/q/e, wildcards, fav:anyone.
-    fav: terms are resolved against the local favorites table.
-    For bulk matching, use _post_matches_query_with_favs with a pre-fetched set.
-    """
-    fav_ids = set()
-    terms = _parse_query_string(query)
-    if any(pat.startswith("fav:") for pat, _ in terms):
-        fav_ids = _get_local_favorite_ids()
-    relations = (
-        get_post_relations(post_id)
-        if any(is_relation_term(pat) for pat, _ in terms)
-        else None
-    )
-    return _post_matches_query_with_favs(
-        tags_dict, rating, post_id, query, fav_ids, relations
-    )
-
-
 def _relations_payload(post):
     """Relationship block for the frontend.
 
@@ -5502,70 +5451,6 @@ def api_stats():
         "tag_graph": _tag_graph.info(),
         "tag_store": _tag_store.info(),
     })
-
-
-@app.route("/api/relations/<int:post_id>")
-def api_relations(post_id):
-    """Stored parent/child/pool info for a post, plus ready-made searches.
-
-    Returns 404 if the post has never been looked up -- that's distinct from
-    a post known to have no relations, which returns nulls and empty lists.
-    """
-    rel = get_post_relations(post_id)
-    if rel is None:
-        return jsonify({"error": f"No relationship data for post {post_id}."}), 404
-    return jsonify({
-        "post_id": post_id,
-        "parent_id": rel["parent_id"],
-        "children": rel["children"],
-        "pools": rel["pools"],
-        "searches": relations_search_tags(post_id, rel),
-        "updated_at": rel["updated_at"],
-    })
-
-
-@app.route("/api/tag_graph")
-def api_tag_graph():
-    """Report what alias/implication export is currently loaded."""
-    return jsonify(_tag_graph.info())
-
-
-@app.route("/api/tag_graph/refresh", methods=["POST"])
-def api_tag_graph_refresh():
-    """Re-download and re-prune the alias/implication graph in the background.
-
-    Pass {"force": true} to re-ingest even if the newest export is one we've
-    already stored — useful after the corpus has grown, since pruning is
-    relative to the tags this database references.
-    """
-    force = bool((request.get_json(silent=True) or {}).get("force"))
-
-    def _do_refresh():
-        try:
-            refresh_tag_graph(force=force)
-        except Exception as e:
-            log.error(f"Tag graph refresh error: {e}")
-
-    threading.Thread(target=_do_refresh, daemon=True).start()
-    return jsonify({"ok": True, "message": "Tag graph refresh started."})
-
-
-@app.route("/api/additions")
-def api_additions_list():
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT tag, category, added_at FROM additions ORDER BY added_at DESC"
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/api/favorites")
-def api_favorites_list():
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT post_id, favorited_at FROM favorites ORDER BY favorited_at DESC"
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
 
 
 # ---------- Tag completion ----------
