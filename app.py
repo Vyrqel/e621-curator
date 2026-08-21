@@ -1749,17 +1749,21 @@ def _enumerate_e621_favorites():
     query = f"fav:{E621_USERNAME}"
     all_ids = set()
     page = 1
-    while True:
-        try:
-            posts = fetch_posts(query, page=page)
-        except requests.RequestException as e:
-            log.warning(f"Favorites sync: error on page {page}: {e}")
-            break
-        if not posts:
-            break
-        for p in posts:
-            all_ids.add(p["id"])
-        page += 1
+    # Total is unknown up front (the API gives no favorite count), so the bar
+    # runs open-ended and just counts posts as pages come in.
+    with tqdm(desc="Favorites sync: fetch", unit="post", leave=False) as bar:
+        while True:
+            try:
+                posts = fetch_posts(query, page=page)
+            except requests.RequestException as e:
+                log.warning(f"Favorites sync: error on page {page}: {e}")
+                break
+            if not posts:
+                break
+            for p in posts:
+                all_ids.add(p["id"])
+            bar.update(len(posts))
+            page += 1
 
     log.info(f"Favorites sync: found {len(all_ids)} favorites on e621.")
     return all_ids
