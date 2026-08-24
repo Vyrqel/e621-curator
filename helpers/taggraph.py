@@ -4,7 +4,6 @@ import csv
 import gzip
 import hashlib
 import io
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -624,30 +623,6 @@ _tag_store = _TagStore()
 # -- ingest --
 
 
-def _find_export_file(prefix, root=None):
-    """Newest local dump whose name starts with `prefix`, or None.
-
-    Accepts anything ending .csv or .csv.gz, so a file downloaded straight
-    from the browser (`tag_aliases-2026-07-27.csv.gz`) works as-is, and so
-    does a plain `tag_aliases.csv`. When several are present the one with the
-    newest date stamp in its filename wins; undated files are ranked by mtime.
-    """
-    root = root or ROOT
-    candidates = [
-        p
-        for p in root.glob(f"{prefix}*")
-        if p.is_file() and (p.name.endswith(".csv") or p.name.endswith(".csv.gz"))
-    ]
-    if not candidates:
-        return None
-
-    def rank(path):
-        found = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
-        return (found.group(1) if found else "", path.stat().st_mtime)
-
-    return max(candidates, key=rank)
-
-
 def _sha256_file(path):
     """Full SHA-256 of a file on disk, hex. Compared against the manifest."""
     digest = hashlib.sha256()
@@ -872,17 +847,11 @@ def _export_sources(manifest, allow_download=True):
             paths = _download_exports(Path(tmp.name), manifest)
             origin = "download"
         except Exception as e:
-            log.warning(f"Tag data: download failed ({e}); trying local dumps.")
+            log.warning(f"Tag data: download failed ({e}).")
             if tmp is not None:
                 tmp.cleanup()
                 tmp = None
             paths = None
-
-    if paths is None:
-        local = {name: _find_export_file(name) for name in TAG_EXPORT_NAMES}
-        if all(local.values()):
-            paths = local
-            origin = "local (" + ", ".join(p.name for p in local.values()) + ")"
 
     # The yield is deliberately outside the try above: an error raised by the
     # caller's body must not be mistaken for a download failure.
