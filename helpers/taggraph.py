@@ -259,9 +259,6 @@ _tag_graph = _TagGraph()
 
 
 # ---------- Tag store ----------
-# The completion corpus: ~870k (name, category, post_count) rows, held as
-# name-ordered chunks that are decompressed only when a lookup lands in them.
-#
 # Chunk payload (uncompressed), rows in ascending name order:
 #   for each row:
 #     varint : length of the prefix shared with the PREVIOUS name in this
@@ -279,9 +276,8 @@ _tag_graph = _TagGraph()
 # Chunks are self-contained: a row's name depends only on rows above it within
 # the same chunk, never on the previous chunk. That is what lets a lookup
 # decompress one chunk in isolation.
-TAG_CHUNK_SIZE = 512  # rows per chunk
-TAG_STORE_DICT_SIZE = 112 * 1024
-TAG_STORE_DICT_SAMPLES = 1024  # chunk payloads sampled to train the dictionary
+TAG_CHUNK_SIZE = 8192  # rows per chunk
+TAG_STORE_DICT_SIZE = 248 * 1024
 TAG_STORE_CACHE = 96  # decompressed chunks held in memory (LRU)
 
 
@@ -553,10 +549,7 @@ class _TagStore:
             conn.execute("DELETE FROM tag_store")
             return {"tags": 0, "chunks": 0, "raw_bytes": 0, "dict_bytes": 0}
 
-        # Even spread rather than the first N, so the dictionary sees the whole
-        # alphabet instead of overfitting to tags beginning with a digit.
-        step = max(1, len(samples) // TAG_STORE_DICT_SAMPLES)
-        training = samples[::step][:TAG_STORE_DICT_SAMPLES]
+        training = samples
         dict_blob = None
         if len(training) >= DICT_MIN_SAMPLES:
             try:
