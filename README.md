@@ -26,6 +26,12 @@ and every post's tags are cached locally in a compressed binary format.
    resume where you left off.
 5. Favorite posts (synced to your real e621 account) and one-click flag new
    artists/characters into "additions" lists for later tracking.
+6. The frontend keeps a small look-ahead buffer of fetched, image-preloaded
+   posts. Reservations are durable (`preload_queue`), so a post committed to
+   the buffer is never served twice and never silently lost if the tab closes
+   before it is displayed.
+7. Each post shows its parent, children and pool memberships, with one-click
+   searches for the rest of the family.
 
 **Background machinery:**
 - **Scanner** — driven by tag-export deltas, not a timer. The blanket periodic
@@ -50,6 +56,11 @@ and every post's tags are cached locally in a compressed binary format.
   Queries actually worth scanning are OR-batched (up to 20 per request via
   e621's `~` syntax), so even a large dirty set costs few calls. Queries with
   new posts become **primed** and get served first.
+
+  A blacklist edit changes what's viewable without moving any `post_count`,
+  so `check_blacklist_change()` hashes `blacklist.txt` at startup and clears
+  every baseline when it differs from the stored hash — otherwise
+  un-blacklisting a tag would never resurface the posts it had been hiding.
 
   Known cost of dropping the periodic sweep: deletions that exactly cancel out
   additions within a single export window are invisible to the diff and get
@@ -141,11 +152,15 @@ phone over Tailscale). Open <http://localhost:8080>.
   jump-to-index counter.
 - **History** — step backward/forward through the session's serve history.
 - **Force rescan** — the ↺ button (confirm-before-fire) triggers an immediate
-  exhausted-query rescan followed by a tag-cache refresh.
+  exhausted-query rescan, then favorites sync + tag backfill, then a tag-graph
+  re-ingest and dictionary retrain.
 - **Connection indicator** — live/scanning/initializing dot; the whole theme
   shifts when the server is unreachable or busy.
 - **Primed counter** — stats bar shows how many scanner-discovered new posts
   are waiting; decrements as you review them.
+- **Relations panel** — parent, children and pool links for the current post,
+  each with a one-click search that pulls the rest of the family into the
+  override bar.
 - **Tag autocomplete** — the override bar completes tags as you type, served
   from the local tag store (`GET /api/tags/suggest`). One ranked pool: real
   tags whose name starts with your fragment, merged with aliases whose
@@ -168,20 +183,35 @@ phone over Tailscale). Open <http://localhost:8080>.
 
 All in `curator.db`:
 
-- `seen` — post IDs you've been shown (marked at serve time).
+- `seen` — post IDs you've been shown (marked when the client renders them,
+  not at serve time).
+- `preload_queue` — posts handed to the client's look-ahead buffer but not yet
+  displayed. The durable half of the seen/reserved split: `seen` means "the
+  user looked at it", this means "we owe the user a look at it". Rows leave by
+  exactly two doors — `/api/seen` on display, or the drain when a post is
+  re-served after the client dropped it. Nothing expires on a timer.
 - `favorites` — favorited posts, kept in sync with e621.
+- `additions` — the artist/character additions lists, mirrored to the two text
+  files.
+- `post_relations` — parent ID, child IDs and pool IDs per post. Children and
+  pools are comma-separated ID lists (e621 hands them over as whole lists and
+  they're only ever read that way); `parent_id` gets its own indexed column
+  because it *is* queried across posts. A missing row means "never looked"; a
+  row with no parent, children or pools means "looked, post is standalone".
 - `post_tags` — per-post tag cache: a flags byte (2-bit rating: `00`=s,
   `01`=q, `10`=e, `11`=unknown; remaining 6 bits reserved) followed by the 9
   fixed tag categories, each a varint count plus null-terminated strings, all
   zstd-compressed against a dictionary trained on the corpus itself.
   **`TAG_CATEGORIES` order is load-bearing — never reorder it.**
 - `tag_dicts` — the zstd dictionaries the blobs above are compressed against,
-  keyed by the version stored in each blob. A retrain writes a new version,
-  rewrites every blob against it, then drops any version nothing references —
-  so this table normally holds exactly one 256 KiB row and does not grow.
-  An older version is retained only if some blob failed to decode and still
-  points at it, which is logged as a warning; dropping it would turn a
-  possibly-transient failure into permanent loss.
+  keyed by **label**, not by a version counter: `dict` is current (blobs whose
+  flag byte is 1) and `dict_old` is the previous one (blobs flagged 0). At most
+  two rows ever exist. A retrain rotates `dict` to `dict_old`, writes the new
+  `dict`, rewrites every blob that decodes, then drops `dict_old` once nothing
+  references it — so this table normally holds exactly one ~248 KiB row and
+  does not grow. `dict_old` survives only when some blob failed to decode and
+  is still stranded on it, which is logged as a warning; dropping it would turn
+  a possibly-transient failure into permanent loss.
 - `tag_graph` — single row holding e621's tag alias and tag implication
   tables, pruned to the tags this database actually references and stored as
   two zstd blobs. Posts keep only their most specific tags; the implied ones
@@ -191,14 +221,14 @@ All in `curator.db`:
 - `refresh_progress` — single-row checkpoint for a full tag-refresh sweep, so
   an interrupted `--refresh-tags` resumes where it stopped instead of
   restarting. Cleared by `--no-resume`.
-- `tag_chunks` + `tag_store` — the autocomplete corpus. All 867k tag names,
-  sorted, front-coded into chunks of 512 and zstd-19 compressed against a
+- `tag_chunks` + `tag_store` — the autocomplete corpus. All ~870k tag names,
+  sorted, front-coded into chunks of 8192 rows and zstd-19 compressed against a
   trained dictionary held in `tag_store` alongside the totals. This replaced a
-  plain `tags` table plus name index: 37 MB → 5.5 MB, and the DB as a whole
-  went 43.0 → 13.1 MB after vacuum. Each chunk carries `max_post_count` so a
+  plain `tags` table plus name index: ~37 MB → ~5 MB across ~1.7k chunks. Each
+  chunk carries `max_post_count` so a
   prefix walk can visit chunks in descending ceiling order and stop once the
   running 12th-best beats every remaining chunk — exact results, but a
-  single-character fragment costs 5 ms cold instead of 83 ms. `tag_store`'s
+  single-character fragment stays in the low milliseconds cold. `tag_store`'s
   dictionary is **not** `tag_dicts`: different codec, different schedule,
   and dropping either breaks a different thing.
 - `db_exports` — one row per tracked e621 export, holding the upstream
@@ -217,20 +247,25 @@ tag cache, not your e621-side favorites.)
 
 ## Endpoints (for inspection / scripting)
 
-- `GET /api/stats` — seen / favorites / additions / queries / exhausted / primed.
+- `GET /api/stats` — seen / favorites / additions / queries / blacklist /
+  exhausted / primed / reserved / tag counts, plus tag-graph and tag-store
+  info and a relations breakdown (posts with a parent / with children / in a
+  pool). `reserved` is the outstanding preload reservations: a number that
+  climbs and never falls means the queue is leaking.
 - `GET /api/next`, `POST /api/seen` — the main serve loop.
 - `GET|POST /api/review`, `GET /api/review/list` — review mode.
 - `GET /api/previous`, `GET /api/history_forward` — history navigation.
 - `POST /api/favorite`, `POST /api/unfavorite` — favoriting (hits e621 too).
 - `POST /api/addition`, `POST /api/addition/remove` — additions lists.
-- `GET /api/additions`, `GET /api/favorites` — full lists as JSON.
 - `GET /api/ping` — liveness/state for the connection indicator.
-- `GET /api/tags/suggest` — ranked tag completions for one fragment.
-- `GET /api/tag_graph` — which alias/implication export is loaded.
-- `POST /api/tag_graph/refresh` — re-read and re-prune the local dumps. Body
-  `{"force": true}` re-ingests even if the files haven't changed, which is what
-  you want after the corpus has grown.
-- `POST /api/force_rescan` — same as the ↺ button.
+- `GET /api/tags/suggest` — ranked tag completions for one fragment. Also
+  completes after a tag-valued metatag (`fav:`, `pool:`, `set:`, `user:`,
+  `voted:`); everything else with a colon takes a number or keyword and is
+  left alone.
+- `POST /api/force_rescan` — same as the ↺ button: clears the page-1 cache,
+  runs an exhausted-query scan, then the maintenance chain, then a full tag-data
+  rebuild (graph re-ingest + dictionary retrain). The tag-cache *refresh* is
+  deliberately not part of it — that's `--refresh-tags` only.
 
 ## Tags are stored minimal
 
@@ -308,12 +343,17 @@ These exit without starting the server:
   the `refresh_progress` checkpoint.
 - `--no-resume` — discard that checkpoint. With `--refresh-tags`, sweeps from
   the top; on normal startup, skips the resume entirely.
+- `--sync-additions` — push both additions files into the DB (replacing the
+  `additions` table wholesale, so hand-deleted entries actually go away) and
+  append any tags missing from `queries.txt`. `queries.txt` is only appended
+  to, never rewritten.
 - `--vacuum` — reclaim free pages. Runs automatically after
   `--rebuild-tag-data` and `--refresh-tags`; this is the manual handle for
   everything else. Never runs while the server is up, which is why a migration
   that frees a lot of space doesn't shrink the file until later.
-- `--dict-samples N` — posts to sample when training the `post_tags` zstd
-  dictionary (default 0 = the whole corpus).
+
+The `post_tags` dictionary is trained on the **whole** corpus — every blob that
+decodes is a sample. There is no sampling knob.
 
 Long-running maintenance draws a tqdm progress bar. Two details, both
 deliberate: a resumed sweep opens at its true position rather than zero, and
@@ -323,8 +363,25 @@ eases toward each batch boundary at a capped velocity instead of snapping
 forward when a batch lands, so it moves smoothly and decelerates when a batch
 runs slow rather than freezing.
 
+## Relation metatags in review mode
+
+Review mode filters against the local cache, so metatags that aren't tags have
+to be answered locally. `parent:`, `child:`, `pool:`, `id:`, `status:` and the
+boolean forms (`ischild:`, `hasparent:`, `isparent:`, `haschild:`,
+`haschildren:`) are matched from `post_relations` and the post ID rather than
+from the tag set — without that, `pool:52413` would be compared against the tag
+list and the review list would come back empty.
+
+Live searches go the other way: `child:<id>` is rewritten to `id:<parent_id>`
+before it reaches e621, which doesn't understand the ID form. A post with no
+parent, or one that can't be resolved, collapses the query to `id:0` so the
+search returns nothing rather than quietly widening. `child:none` / `child:any`
+pass through untouched.
+
 ## Notes & invariants
 
+- Post endpoints are called with `v2=true&mode=extended` unconditionally and
+  post objects are consumed in v2 shape. There is no legacy fallback path.
 - e621's rate limit is 2 req/s; this app caps at 1 req/s
   (`MIN_REQUEST_INTERVAL = 1.0`) and requests 320 posts/page (the API max).
 - e621 sorts by upload ID, newest first — new posts always surface at the top
@@ -339,7 +396,8 @@ runs slow rather than freezing.
   frontend POSTs `/api/seen` once it actually displays the post. Closing the
   tab after the post is on screen still counts it as seen; a post served but
   never rendered (tab closed mid-fetch, failed POST) stays unseen and can come
-  back later. Review-mode and history navigation deliberately don't mark.
+  back later — its `preload_queue` row keeps it owed, and the drain re-serves
+  it. Review-mode and history navigation deliberately don't mark.
 - A tag that turns out to hold no posts at all is **expunged**: its query row
   and file lines are removed, but only after a sweep walks the tag's entire
   `status:deleted` history (capped at 25 pages) purging any locally-held IDs.
