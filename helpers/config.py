@@ -129,7 +129,6 @@ DICT_SIZE = (
     248 * 1024
 )  # trained dictionary target size; consider zipfian calculation in the future
 DICT_MIN_SAMPLES = 64  # below this, training is pointless — go dictionary-less
-DICT_TRAIN_SAMPLES = 0  # 0 = train on the whole corpus; set via --dict-samples
 
 _BLOB_FMT_V3 = 0x03  # current blob wrapper: marker + 1-byte dict flag + frame
 

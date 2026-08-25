@@ -31,7 +31,6 @@ Data files (curator.db, queries.txt, the CSV dumps) stay beside this file.
 import argparse
 import logging
 
-from helpers import config
 from helpers.database import init_db, run_vacuum
 from helpers.maintenance import start_maintenance
 from helpers.runtime import TqdmLoggingHandler, app, log
@@ -60,13 +59,6 @@ if __name__ == "__main__":
         type=int,
         default=8080,
         help="Port to listen on (default: 8080).",
-    )
-    parser.add_argument(
-        "--dict-samples",
-        type=int,
-        default=0,
-        help="Number of posts to sample for zstd dictionary training "
-        "(default: 0 = use the entire corpus).",
     )
     parser.add_argument(
         "--refresh-tags",
@@ -107,7 +99,6 @@ if __name__ == "__main__":
         "only added to, never rewritten.",
     )
     args = parser.parse_args()
-    config.DICT_TRAIN_SAMPLES = max(0, args.dict_samples)
 
     logging.basicConfig(
         level=logging.INFO,

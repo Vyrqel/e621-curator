@@ -1,12 +1,10 @@
 import bisect
-import random
 import threading
 import time
 
 import zstandard as zstd
 from tqdm import tqdm
 
-from . import config
 from .config import (
     _BLOB_FMT_V3,
     DICT_MIN_SAMPLES,
@@ -473,9 +471,8 @@ def retrain_tag_dict():
     and old dict, both fully intact (each blob's own flag byte makes any
     committed state self-describing regardless).
 
-    Honors DICT_TRAIN_SAMPLES (--dict-samples): 0 trains on everything,
-    otherwise a random sample of that many payloads. Rewrites all
-    successfully-decoded blobs either way.
+    Trains on every successfully-decoded blob's payload and rewrites all of
+    them against the new dictionary.
 
     Returns stats dict, or None if there was nothing to do.
     """
@@ -524,8 +521,6 @@ def retrain_tag_dict():
             return None
 
         samples = [p for p, _ in payloads.values()]
-        if config.DICT_TRAIN_SAMPLES and config.DICT_TRAIN_SAMPLES < len(samples):
-            samples = random.sample(samples, config.DICT_TRAIN_SAMPLES)
 
         new_dict = None
         if len(samples) >= DICT_MIN_SAMPLES:
