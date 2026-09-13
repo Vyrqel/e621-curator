@@ -58,6 +58,13 @@ class _SmoothBar:
     The display never moves backwards and never passes the batch boundary,
     so easing can lead reality within the current batch but can't claim a
     batch that hasn't landed.
+
+    With `lag=True` the bar never draws anything unconfirmed. Instead it
+    trails reality by roughly one batch: each landing batch starts a new
+    linear segment from wherever the display currently sits to the confirmed
+    count, timed to finish just as the next batch is expected to land. This
+    suits open-ended walks, where the in-flight batch size is only a guess
+    and leading reality would overshoot.
     """
 
     TICK = 0.1  # seconds between display updates (10 FPS)
@@ -65,8 +72,9 @@ class _SmoothBar:
     REACH = 3.0  # tau divisor: ~95% of the way at the expected duration
     OVERRUN = 1.25  # velocity ceiling, as a multiple of the estimated pace
     FIRST_GUESS = 4.0  # seconds to assume for the first batch, rate unknown
+    LAG_STRETCH = 1.1  # lag mode: segment length vs. expected batch time
 
-    def __init__(self, total, desc, initial=0):
+    def __init__(self, total, desc, initial=0, lag=False):
         # `initial` is work completed before this run started (a resumed
         # refresh), so the bar opens partway along a full-sweep total instead
         # of restarting at 0 against the remaining slice.
@@ -78,6 +86,11 @@ class _SmoothBar:
         self.started = None  # monotonic time the in-flight batch began
         self.cap = 0.0  # max posts/s the display may move at
         self.tau = self.FIRST_GUESS / self.REACH
+        self.lag = lag
+        self.batch_time = 0.0  # lag mode: smoothed seconds per batch
+        self.seg_from = float(initial)  # lag mode: segment start value
+        self.seg_start = time.monotonic()  # lag mode: segment start time
+        self.seg_len = 0.0  # lag mode: segment duration in seconds
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.bar = tqdm(
@@ -107,6 +120,9 @@ class _SmoothBar:
             now = time.monotonic()
             dt, last = now - last, now
             with self.lock:
+                if self.lag:
+                    self._tick_lag(now)
+                    continue
                 remaining = (self.actual + self.pending) - self.shown
                 if remaining <= 0:
                     continue
@@ -119,6 +135,16 @@ class _SmoothBar:
                 velocity = min(remaining / self.tau, self.cap or remaining)
                 self._draw(self.shown + velocity * dt)
 
+    def _tick_lag(self, now):
+        """Lag mode: walk the current segment toward the confirmed count."""
+        if self.shown >= self.actual:
+            return
+        if self.seg_len <= 0:
+            self._draw(self.actual)
+            return
+        frac = min((now - self.seg_start) / self.seg_len, 1.0)
+        self._draw(self.seg_from + (self.actual - self.seg_from) * frac)
+
     def _draw(self, target):
         """Move the display to `target`, clamped. Caller holds the lock.
 
@@ -126,7 +152,7 @@ class _SmoothBar:
         but the bar itself is only ever advanced in whole posts — tqdm would
         otherwise render a fractional count.
         """
-        ceiling = self.actual + self.pending
+        ceiling = self.actual + (0 if self.lag else self.pending)
         if self.total is not None:
             ceiling = min(self.total, ceiling)
         self.shown = max(self.shown, min(target, ceiling))
@@ -170,6 +196,20 @@ class _SmoothBar:
                 )
             self.actual += self.pending
             self.pending = 0
+            if self.lag:
+                if elapsed > 0:
+                    self.batch_time = (
+                        elapsed
+                        if self.batch_time == 0
+                        else self.ALPHA * elapsed
+                        + (1 - self.ALPHA) * self.batch_time
+                    )
+                # Re-plan from where the display is now, so the new segment
+                # continues the old one's motion instead of jumping.
+                self.seg_from = self.shown
+                self.seg_start = time.monotonic()
+                self.seg_len = self.batch_time * self.LAG_STRETCH
+                return
             # A corrected batch can come back smaller than the curve already
             # drew against. The display never walks backwards, so just drop
             # the float back to reality and let the next batch's motion pick
