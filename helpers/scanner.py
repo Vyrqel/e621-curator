@@ -6,6 +6,7 @@ from tqdm import tqdm
 
 from .config import (
     BLACKLIST_FILE,
+    DELETED_SWEEP_PAGE_CAP,
     POSTS_PER_PAGE,
     QUERIES_FILE,
     RESCAN_BATCH_TAGS,
@@ -218,9 +219,6 @@ def expunge_empty_tag(tag):
         f"dropped from exhausted list, removed {removed_lines} queries.txt "
         f"line(s), {additions_removed} additions row(s)."
     )
-
-
-DELETED_SWEEP_PAGE_CAP = 25  # 8000 posts; guards against a runaway walk
 
 
 def _purge_deleted_for_tag(tag, max_pages=1):
