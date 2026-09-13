@@ -134,10 +134,17 @@ TAG_CATEGORIES = (
 )
 
 ZSTD_LEVEL = 19
-DICT_SIZE = (
-    248 * 1024
-)  # trained dictionary target size; consider zipfian calculation in the future
 DICT_MIN_SAMPLES = 64  # below this, training is pointless — go dictionary-less
+
+# Dictionary size is searched, not fixed (see train_best_dict in tagcodec.py).
+# Candidates double from MIN to MAX; each is trained on the samples minus a
+# held-out slice and scored by projected total storage (dictionary included)
+# when compressing that slice at ZSTD_LEVEL. Don't score at a faster level:
+# higher levels get more out of a large dictionary, so a fast-level search
+# picks sizes that are too small.
+DICT_SEARCH_MIN_BYTES = 4 * 1024
+DICT_SEARCH_MAX_BYTES = 1024 * 1024
+DICT_HOLDOUT_FRACTION = 0.2
 
 _BLOB_FMT_V3 = 0x03  # current blob wrapper: marker + 1-byte dict flag + frame
 
@@ -152,7 +159,6 @@ _RATING_MASK = 0b11
 # Packed (pre-compression) bytes per chunk. Bounds the work of one lookup
 # regardless of how long the tag names in that stretch of the list are.
 TAG_CHUNK_BYTES = 64 * 1024
-TAG_STORE_DICT_SIZE = 248 * 1024
 # Decoded-chunk LRU budget, as a fraction of installed RAM (0.25% of 8 GB is
 # ~20 MB). Measured as Python heap footprint of the decoded rows, which runs
 # several times the packed size. The floor keeps small machines usable.
