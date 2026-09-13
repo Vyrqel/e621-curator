@@ -23,10 +23,11 @@ def _enumerate_e621_favorites():
     query = f"fav:{E621_USERNAME}"
     all_ids = set()
     page = 1
-    # Total is unknown up front, so the bar runs open-ended. Each page is
-    # assumed full while in flight and corrected on arrival, which lets the
-    # same easing curve that drives the tag sweeps drive this too.
-    bar = _SmoothBar(None, "Favorites sync: fetch")
+    # Total is unknown up front, so the bar runs open-ended. Page sizes are
+    # only a guess while in flight, so the bar runs in lag mode: it trails the
+    # confirmed count by about a page and interpolates between landed pages,
+    # rather than leading reality and overshooting on the short final page.
+    bar = _SmoothBar(None, "Favorites sync: fetch", lag=True)
     try:
         while True:
             bar.batch_start(POSTS_PER_PAGE)
