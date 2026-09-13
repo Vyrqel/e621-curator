@@ -11,6 +11,8 @@ QUERIES_FILE = ROOT / "queries.txt"
 BLACKLIST_FILE = ROOT / "blacklist.txt"
 ADDITIONS_ARTISTS_FILE = ROOT / "additions_artists.txt"
 ADDITIONS_CHARACTERS_FILE = ROOT / "additions_characters.txt"
+# Local copies of the tag exports, used instead of the network by --local-csv.
+LOCAL_CSV_DIR = ROOT / "csv"
 
 # IMPORTANT: e621 requires a descriptive User-Agent with contact info.
 USER_AGENT = "e621-curator-beta/1.0 (by Vyrqel on e621)"

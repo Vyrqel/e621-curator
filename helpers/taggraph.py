@@ -4,6 +4,7 @@ import csv
 import gzip
 import hashlib
 import io
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -23,6 +24,7 @@ from .config import (
     DB_EXPORT_MANIFEST,
     DICT_MIN_SAMPLES,
     DOWNLOAD_CHUNK,
+    LOCAL_CSV_DIR,
     ROOT,
     TAG_CATEGORIES,
     TAG_EXPORT_NAMES,
@@ -817,6 +819,54 @@ def _download_exports(dest_dir, manifest):
     return paths
 
 
+# -- local CSV mode --
+
+# Set by --local-csv. When on, the tag exports are read from LOCAL_CSV_DIR and
+# e621 is never contacted for them (beyond a one-off fetch of any file that's
+# missing), so repeated restarts while testing don't re-download ~40 MB each.
+_local_csv = False
+_LOCAL_MANIFEST = LOCAL_CSV_DIR / "manifest.json"
+
+
+def _local_csv_paths():
+    """{name: path} for a full local set in LOCAL_CSV_DIR, or None."""
+    paths = {}
+    for name in TAG_EXPORT_NAMES:
+        for suffix in (".csv.gz", ".csv"):
+            candidate = LOCAL_CSV_DIR / f"{name}{suffix}"
+            if candidate.is_file() and candidate.stat().st_size:
+                paths[name] = candidate
+                break
+        else:
+            return None
+    return paths
+
+
+def _local_manifest():
+    """The manifest saved alongside the local copies, or None."""
+    try:
+        return json.loads(_LOCAL_MANIFEST.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def enable_local_csv():
+    """Turn on local CSV mode, downloading the exports once if they're absent.
+
+    Existing copies are never re-fetched; delete the csv folder to refresh.
+    """
+    global _local_csv
+    _local_csv = True
+    if _local_csv_paths() is not None:
+        log.info(f"Tag data: local CSV mode, using copies in {LOCAL_CSV_DIR}.")
+        return
+    LOCAL_CSV_DIR.mkdir(exist_ok=True)
+    log.info(f"Tag data: local CSV mode, downloading exports to {LOCAL_CSV_DIR}.")
+    manifest = _fetch_export_manifest()
+    _download_exports(LOCAL_CSV_DIR, manifest)
+    _LOCAL_MANIFEST.write_text(json.dumps(manifest, indent=2))
+
+
 @contextmanager
 def _export_sources(manifest, allow_download=True):
     """Yield ({name: path}, origin) for this refresh.
@@ -942,6 +992,9 @@ def refresh_tag_graph(force=False, allow_download=True):
     matching checksums; `allow_download=False` skips the network entirely and
     reuses whatever dumps are sitting in ROOT.
     """
+    if _local_csv:
+        return _refresh_from_local_csv(force)
+
     manifest = None
     if allow_download:
         try:
@@ -982,6 +1035,34 @@ def refresh_tag_graph(force=False, allow_download=True):
         stats = _ingest_tag_data(paths)
 
     if manifest and origin == "download":
+        _record_exports(manifest)
+    return stats
+
+
+def _refresh_from_local_csv(force):
+    """refresh_tag_graph for local CSV mode: no network, ever.
+
+    Without `force`, ingests only when the local copies differ from what was
+    last recorded (or nothing has been recorded), so restarts stay cheap.
+    """
+    paths = _local_csv_paths()
+    if paths is None:
+        log.warning(f"Tag data: local CSV mode, but {LOCAL_CSV_DIR} lacks a full set.")
+        return None
+
+    manifest = _local_manifest()
+    if not force:
+        stored = _stored_exports()
+        if manifest and all(
+            stored.get(n, {}).get("checksum") == manifest.get(n, {}).get("checksum")
+            for n in TAG_EXPORT_NAMES
+        ):
+            log.info("Tag data: local copies already ingested; skipping.")
+            return None
+
+    log.info(f"Tag data: ingesting from {LOCAL_CSV_DIR}.")
+    stats = _ingest_tag_data(paths)
+    if manifest and all(n in manifest for n in TAG_EXPORT_NAMES):
         _record_exports(manifest)
     return stats
 
@@ -1274,6 +1355,11 @@ def _tag_graph_loop():
             # A fresh ingest replaced the whole tags table and both graph
             # blobs. Reclaim before going back to sleep.
             run_vacuum()
+
+        if _local_csv:
+            # Nothing will ever change underneath us; no point polling.
+            log.info("Tag data: local CSV mode, thread going idle.")
+            return
 
         due_in = _seconds_until_next_export()
         if changed or due_in > 0:

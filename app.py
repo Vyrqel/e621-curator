@@ -40,7 +40,7 @@ from helpers.tagcache import (
     refresh_tag_cache,
     resume_interrupted_refresh,
 )
-from helpers.taggraph import start_tag_graph_sync
+from helpers.taggraph import enable_local_csv, start_tag_graph_sync
 from helpers.userfiles import reconcile_additions_files, sync_additions_files
 
 # Imported for its side effects: importing the module is what registers the
@@ -98,6 +98,14 @@ if __name__ == "__main__":
         "append any tags missing from queries.txt, then exit. queries.txt is "
         "only added to, never rewritten.",
     )
+    parser.add_argument(
+        "--local-csv",
+        action="store_true",
+        help="Use local copies of the tag exports in ./csv instead of fetching "
+        "them from e621, downloading them there first if any are missing. "
+        "Combine with other flags (e.g. --rebuild-tag-data) to avoid hitting "
+        "e621 while testing. Delete ./csv to pull fresh copies.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -106,6 +114,14 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
         handlers=[TqdmLoggingHandler()],
     )
+
+    if args.local_csv:
+        init_db()
+        try:
+            enable_local_csv()
+        except Exception as e:
+            log.error(f"Local CSV download failed: {e}")
+            raise SystemExit(1)
 
     if args.vacuum:
         init_db()
