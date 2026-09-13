@@ -522,7 +522,7 @@ def retrain_tag_dict():
                 "SELECT post_id, tags_blob, cached_at FROM post_tags"
             ).fetchall()
         if not rows:
-            log.info("Dict retrain: no cached tags, skipping.")
+            log.info("Post tag cache retrain: no cached tags, skipping.")
             return None
 
         # Decode fully (not just decompress) since retrain is a full rewrite
@@ -533,7 +533,7 @@ def retrain_tag_dict():
         errors = 0
         for r in tqdm(
             rows,
-            desc="Dict retrain: decode",
+            desc="Post tag cache retrain: decoding blobs",
             unit="blob",
             leave=False,
             **TQDM_STEADY,
@@ -550,11 +550,11 @@ def retrain_tag_dict():
             except Exception as e:
                 errors += 1
                 log.warning(
-                    f"Dict retrain: undecodable blob for post {r['post_id']}: {e}"
+                    f"Post tag cache retrain: undecodable blob for post {r['post_id']}: {e}"
                 )
         if errors:
             log.warning(
-                f"Dict retrain: skipped {errors} undecodable blob(s) — they stay "
+                f"Post tag cache retrain: skipped {errors} undecodable blob(s) — they stay "
                 f"on whatever dict they already referenced."
             )
         if not payloads:
@@ -568,17 +568,17 @@ def retrain_tag_dict():
                 t0 = time.time()
                 new_dict = zstd.train_dictionary(DICT_SIZE, samples)
                 log.info(
-                    f"Dict retrain: trained {len(new_dict.as_bytes())}-byte "
+                    f"Post tag cache retrain: trained {len(new_dict.as_bytes())}-byte "
                     f"dictionary from {len(samples)} sample(s) "
                     f"in {time.time() - t0:.1f}s."
                 )
             except Exception as e:
                 log.warning(
-                    f"Dict retrain: training failed ({e}); going dictionary-less."
+                    f"Post tag cache retrain: training failed ({e}); going dictionary-less."
                 )
         else:
             log.info(
-                f"Dict retrain: only {len(samples)} sample(s) "
+                f"Post tag cache retrain: only {len(samples)} sample(s) "
                 f"(< {DICT_MIN_SAMPLES}), going dictionary-less."
             )
 
@@ -589,7 +589,7 @@ def retrain_tag_dict():
             (prefix + cctx.compress(raw), post_id)
             for post_id, (raw, _cached_at) in tqdm(
                 payloads.items(),
-                desc="Dict retrain: recompress",
+                desc="Post tag cache retrain: recompressing blobs",
                 unit="blob",
                 leave=False,
                 **TQDM_STEADY,
@@ -627,7 +627,7 @@ def retrain_tag_dict():
             stranded = errors > 0 and new_dict is not None
             if stranded:
                 log.warning(
-                    f"Dict retrain: kept 'dict_old' — {errors} blob(s) could not "
+                    f"Post tag cache retrain: kept 'dict_old' — {errors} blob(s) could not "
                     f"be rewritten and still reference it. It stays until those "
                     f"blobs are refreshed or force-rewritten."
                 )
@@ -636,7 +636,7 @@ def retrain_tag_dict():
                     "DELETE FROM tag_dicts WHERE label = 'dict_old'"
                 ).rowcount
                 if pruned:
-                    log.info("Dict retrain: dropped unreferenced 'dict_old'.")
+                    log.info("Post tag cache retrain: dropped unreferenced 'dict_old'.")
 
         # Force the manager to reload committed state on next use.
         _tag_dicts._loaded = False
@@ -649,7 +649,7 @@ def retrain_tag_dict():
             "new_avg": new_bytes / n,
         }
         log.info(
-            f"Dict retrain: rewrote {n} blob(s) "
+            f"Post tag cache retrain: rewrote {n} blob(s). "
             f"Avg bytes/post: {stats['old_avg']:.1f} -> {stats['new_avg']:.1f} "
             f"({(1 - new_bytes / old_bytes) * 100:.1f}% saved, "
             f"total {old_bytes} -> {new_bytes} bytes)."
@@ -720,10 +720,9 @@ def rebuild_tag_data(allow_download=True):
     against whatever graph is currently stored.
     """
     graph = refresh_tag_graph(force=True, allow_download=allow_download)
-    log.info(f"Tag graph refresh result: {graph}")
     stats = retrain_tag_dict()
     if stats is None:
-        log.info("Dict retrain: nothing to do.")
+        log.info("Post tag cache retrain: nothing to do.")
     # Both halves have finished churning — the tags table was rewritten
     # wholesale and every blob in post_tags was replaced. This is the point
     # with the most free space to reclaim.

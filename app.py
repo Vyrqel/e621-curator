@@ -141,11 +141,11 @@ if __name__ == "__main__":
     if args.rebuild_tag_data:
         init_db()
         try:
-            result = rebuild_tag_data()
+            rebuild_tag_data()
         except Exception as e:
-            log.error(f"Tag data rebuild failed: {e}")
+            log.error(f"--rebuild-tag-data failed: {e}")
             raise SystemExit(1)
-        log.info(f"Tag data rebuild complete: {result}")
+        log.info("--rebuild-tag-data complete.")
         raise SystemExit(0)
 
     if args.refresh_tags:

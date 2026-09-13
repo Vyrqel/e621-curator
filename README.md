@@ -222,7 +222,7 @@ All in `curator.db`:
   an interrupted `--refresh-tags` resumes where it stopped instead of
   restarting. Cleared by `--no-resume`.
 - `tag_chunks` + `tag_store` — the autocomplete corpus. All ~870k tag names,
-  sorted, front-coded into chunks of 8192 rows and zstd-19 compressed against a
+  sorted, front-coded into chunks of ~64 KiB and zstd-19 compressed against a
   trained dictionary held in `tag_store` alongside the totals. This replaced a
   plain `tags` table plus name index: ~37 MB → ~5 MB across ~1.7k chunks. Each
   chunk carries `max_post_count` so a
