@@ -707,8 +707,8 @@ def rebuild_tag_data(allow_download=True):
     means doing it again afterwards. Bundled here so the CLI flag and the
     force-rescan route share one definition of "in that order".
 
-    `allow_download=False` reuses whatever dumps are already sitting in ROOT
-    instead of fetching fresh ones.
+    `allow_download=False` skips fetching; the graph half then only ingests
+    anything when --local-csv mode is on.
 
     Exposed as `--rebuild-tag-data` and used by the force-rescan route; there
     is deliberately no way to run just one half from the command line.

@@ -25,7 +25,6 @@ from .config import (
     DICT_MIN_SAMPLES,
     DOWNLOAD_CHUNK,
     LOCAL_CSV_DIR,
-    ROOT,
     TAG_CATEGORIES,
     TAG_EXPORT_NAMES,
     TAG_EXPORT_PERIOD,
@@ -872,11 +871,9 @@ def _export_sources(manifest, allow_download=True):
     """Yield ({name: path}, origin) for this refresh.
 
     Downloads go to a temp directory that is deleted on the way out, so no
-    multi-megabyte CSVs are ever left sitting next to app.py. If the download
-    fails we fall back to any dumps already in the app directory, which keeps
-    the manual browser-download workflow available as an escape hatch. Local
-    dumps can't be verified — there's no checksum to hold them to — so they're
-    trusted as-is and the manifest is not recorded for them.
+    multi-megabyte CSVs are ever left sitting next to app.py. There is no
+    fallback to files on disk here; local copies are handled separately by
+    --local-csv (see _refresh_from_local_csv).
 
     `paths` is None (origin "missing") when the full set can't be assembled.
     """
@@ -989,8 +986,8 @@ def refresh_tag_graph(force=False, allow_download=True):
 
     Returns a stats dict, or None when there was nothing to do (checksums all
     matched) or the exports couldn't be obtained. `force` re-ingests even on
-    matching checksums; `allow_download=False` skips the network entirely and
-    reuses whatever dumps are sitting in ROOT.
+    matching checksums; `allow_download=False` skips the network entirely, so
+    nothing is ingested unless local CSV mode is on.
     """
     if _local_csv:
         return _refresh_from_local_csv(force)
@@ -1024,9 +1021,9 @@ def refresh_tag_graph(force=False, allow_download=True):
         if paths is None:
             log.warning(
                 f"Tag data: could not obtain the {', '.join(TAG_EXPORT_NAMES)} "
-                f"exports, and a full set is not sitting in {ROOT}. Download "
-                f"them from {DB_EXPORT_INDEX} and drop them in that folder as "
-                f"a fallback (.csv or .csv.gz). Running without alias, "
+                f"exports, and no local copies are in use. Download "
+                f"them from {DB_EXPORT_INDEX} into {LOCAL_CSV_DIR} (.csv or "
+                f".csv.gz) and start with --local-csv as a fallback. Running without alias, "
                 f"implication and completion support until then."
             )
             return None
