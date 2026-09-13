@@ -26,12 +26,15 @@ from .config import (
     DOWNLOAD_CHUNK,
     LOCAL_CSV_DIR,
     TAG_CATEGORIES,
+    TAG_CHUNK_SIZE,
     TAG_EXPORT_NAMES,
     TAG_EXPORT_PERIOD,
     TAG_EXPORT_RETRY_ATTEMPTS,
     TAG_EXPORT_RETRY_INTERVAL,
     TAG_GRAPH_TIMEOUT,
     TAG_MIN_POST_COUNT,
+    TAG_STORE_CACHE,
+    TAG_STORE_DICT_SIZE,
     TQDM_STEADY,
     USER_AGENT,
     ZSTD_LEVEL,
@@ -277,9 +280,6 @@ _tag_graph = _TagGraph()
 # Chunks are self-contained: a row's name depends only on rows above it within
 # the same chunk, never on the previous chunk. That is what lets a lookup
 # decompress one chunk in isolation.
-TAG_CHUNK_SIZE = 8192  # rows per chunk
-TAG_STORE_DICT_SIZE = 248 * 1024
-TAG_STORE_CACHE = 96  # decompressed chunks held in memory (LRU)
 
 
 class _TagStore:
@@ -548,7 +548,13 @@ class _TagStore:
         if not total:
             conn.execute("DELETE FROM tag_chunks")
             conn.execute("DELETE FROM tag_store")
-            return {"tags": 0, "chunks": 0, "raw_bytes": 0, "dict_bytes": 0}
+            return {
+                "tags": 0,
+                "chunks": 0,
+                "raw_bytes": 0,
+                "compressed_bytes": 0,
+                "dict_bytes": 0,
+            }
 
         training = samples
         dict_blob = None
@@ -568,13 +574,16 @@ class _TagStore:
 
         conn.execute("DELETE FROM tag_chunks")
         raw_bytes = 0
+        compressed_bytes = 0
         chunk_count = 0
 
         def _packed():
-            nonlocal raw_bytes, chunk_count
+            nonlocal raw_bytes, compressed_bytes, chunk_count
             for i, batch in enumerate(_chunks(row_iter())):
                 raw = cls._pack_chunk(batch)
                 raw_bytes += len(raw)
+                blob = cctx.compress(raw)
+                compressed_bytes += len(blob)
                 chunk_count += 1
                 yield (
                     i,
@@ -582,7 +591,7 @@ class _TagStore:
                     batch[-1][0],
                     max(r[2] for r in batch),
                     len(batch),
-                    cctx.compress(raw),
+                    blob,
                 )
 
         conn.executemany(
@@ -607,6 +616,7 @@ class _TagStore:
             "tags": total,
             "chunks": chunk_count,
             "raw_bytes": raw_bytes,
+            "compressed_bytes": compressed_bytes,
             "dict_bytes": len(dict_blob) if dict_blob else 0,
         }
 
@@ -1188,6 +1198,16 @@ def _ingest_tags_table(path, aliases):
         f"packed into {built['chunks']} chunks, {built['raw_bytes'] / 1e6:.1f} MB "
         f"raw, {built['dict_bytes'] / 1024:.0f} KB dictionary."
     )
+    if built["tags"] and built["raw_bytes"]:
+        raw_bytes = built["raw_bytes"]
+        new_bytes = built["compressed_bytes"]
+        log.info(
+            f"Tag store: compressed {built['chunks']} chunk(s) "
+            f"Avg bytes/tag: {raw_bytes / built['tags']:.1f} -> "
+            f"{new_bytes / built['tags']:.1f} "
+            f"({(1 - new_bytes / raw_bytes) * 100:.1f}% saved, "
+            f"total {raw_bytes} -> {new_bytes} bytes)."
+        )
     return kept
 
 

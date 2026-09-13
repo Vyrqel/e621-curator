@@ -6,7 +6,7 @@ import urllib.parse
 import requests
 from flask import jsonify, render_template, request
 
-from .config import ROOT, TAG_CATEGORIES, _server_state
+from .config import ROOT, SUGGEST_LIMIT, TAG_CATEGORIES, _server_state
 from .database import db
 from .e6api import (
     _auth,
@@ -666,9 +666,6 @@ def api_stats():
 # after the colon. Everything else with a colon (score:, rating:, order:, ...)
 # takes a number, a keyword or a range, and is left alone.
 _COMPLETABLE_METATAGS = ("fav:", "pool:", "set:", "user:", "voted:")
-
-SUGGEST_LIMIT = 12
-
 
 @app.route("/api/tags/suggest")
 def api_tags_suggest():

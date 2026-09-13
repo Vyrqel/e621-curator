@@ -71,6 +71,13 @@ DB_BUSY_TIMEOUT = 300.0
 # never match anything, and e621 carries a very large tail of them.
 TAG_MIN_POST_COUNT = 1
 
+# Periodic deleted-post sweeps stop after this many pages per tag.
+DELETED_SWEEP_PAGE_CAP = 25  # 8000 posts; guards against a runaway walk
+
+# Default number of tag autocomplete suggestions. static/style.css sizes the
+# suggestion dropdown to fit exactly this many rows — keep the two in sync.
+SUGGEST_LIMIT = 12
+
 # ---------- Tag codec ----------
 # Compact binary encoding for e621 tag dicts.
 #
@@ -139,6 +146,12 @@ _RATING_BITS = {"s": 0b00, "q": 0b01, "e": 0b10}
 _BITS_RATING = {0b00: "s", 0b01: "q", 0b10: "e", 0b11: None}
 
 _RATING_MASK = 0b11
+
+# ---------- Tag store ----------
+# Chunked, zstd-compressed tag list (see _TagStore in taggraph.py).
+TAG_CHUNK_SIZE = 8192  # rows per chunk
+TAG_STORE_DICT_SIZE = 248 * 1024
+TAG_STORE_CACHE = 96  # decompressed chunks held in memory (LRU)
 
 # ---------- Progress bars / downloads ----------
 # right knob for a bar stepped per item.
