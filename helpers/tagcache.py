@@ -7,8 +7,6 @@ from tqdm import tqdm
 
 from .config import (
     _BLOB_FMT_V3,
-    DICT_MIN_SAMPLES,
-    DICT_SIZE,
     POSTS_PER_PAGE,
     TQDM_STEADY,
     ZSTD_LEVEL,
@@ -28,7 +26,13 @@ from .posts import (
     set_refresh_progress,
 )
 from .runtime import log
-from .tagcodec import _decode_raw_v3, _decompress_blob, _encode_raw_v3, _tag_dicts
+from .tagcodec import (
+    _decode_raw_v3,
+    _decompress_blob,
+    _encode_raw_v3,
+    _tag_dicts,
+    train_best_dict,
+)
 from .taggraph import _tag_graph, refresh_tag_graph
 
 
@@ -530,6 +534,8 @@ def retrain_tag_dict():
         # graph, so a graph refresh shrinks old blobs too.
         payloads = {}
         old_bytes = 0
+        old_cdict = _tag_dicts.current()
+        old_dict_bytes = len(old_cdict.as_bytes()) if old_cdict else 0
         errors = 0
         for r in tqdm(
             rows,
@@ -562,25 +568,9 @@ def retrain_tag_dict():
 
         samples = [p for p, _ in payloads.values()]
 
-        new_dict = None
-        if len(samples) >= DICT_MIN_SAMPLES:
-            try:
-                t0 = time.time()
-                new_dict = zstd.train_dictionary(DICT_SIZE, samples)
-                log.info(
-                    f"Post tag cache retrain: trained {len(new_dict.as_bytes())}-byte "
-                    f"dictionary from {len(samples)} sample(s) "
-                    f"in {time.time() - t0:.1f}s."
-                )
-            except Exception as e:
-                log.warning(
-                    f"Post tag cache retrain: training failed ({e}); going dictionary-less."
-                )
-        else:
-            log.info(
-                f"Post tag cache retrain: only {len(samples)} sample(s) "
-                f"(< {DICT_MIN_SAMPLES}), going dictionary-less."
-            )
+        t0 = time.time()
+        new_dict = train_best_dict(samples, "Post tag cache retrain")
+        log.info(f"Post tag cache retrain: dictionary step took {time.time() - t0:.1f}s.")
 
         cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, dict_data=new_dict)
         prefix = bytes([_BLOB_FMT_V3, 1])  # every rewritten blob is "current"
@@ -642,17 +632,23 @@ def retrain_tag_dict():
         _tag_dicts._loaded = False
 
         new_bytes = sum(len(b) for b, _ in rewritten)
+        new_dict_bytes = len(new_dict.as_bytes()) if new_dict else 0
         n = len(rewritten)
         stats = {
             "posts": n,
             "old_avg": old_bytes / n,
             "new_avg": new_bytes / n,
         }
+        # The dictionary is part of the storage cost; comparing blob bytes
+        # alone makes a smaller dictionary look like a regression.
+        old_total = old_bytes + old_dict_bytes
+        new_total = new_bytes + new_dict_bytes
         log.info(
             f"Post tag cache retrain: rewrote {n} blob(s). "
-            f"Avg bytes/post: {stats['old_avg']:.1f} -> {stats['new_avg']:.1f} "
-            f"({(1 - new_bytes / old_bytes) * 100:.1f}% saved, "
-            f"total {old_bytes} -> {new_bytes} bytes)."
+            f"Avg bytes/post: {stats['old_avg']:.1f} -> {stats['new_avg']:.1f}; "
+            f"dictionary {old_dict_bytes} -> {new_dict_bytes} bytes; "
+            f"total {old_total} -> {new_total} bytes "
+            f"({(1 - new_total / old_total) * 100:.1f}% saved)."
         )
         return stats
 

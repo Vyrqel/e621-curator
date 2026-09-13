@@ -23,7 +23,6 @@ from tqdm import tqdm
 from .config import (
     DB_EXPORT_INDEX,
     DB_EXPORT_MANIFEST,
-    DICT_MIN_SAMPLES,
     DOWNLOAD_CHUNK,
     LOCAL_CSV_DIR,
     TAG_CATEGORIES,
@@ -36,7 +35,6 @@ from .config import (
     TAG_MIN_POST_COUNT,
     TAG_STORE_CACHE_FRACTION,
     TAG_STORE_CACHE_MIN_BYTES,
-    TAG_STORE_DICT_SIZE,
     TQDM_STEADY,
     USER_AGENT,
     ZSTD_LEVEL,
@@ -44,7 +42,7 @@ from .config import (
 from .database import db, run_vacuum
 from .e6api import _session, rate_limit
 from .runtime import _log_next, log
-from .tagcodec import _get_varint, _put_varint
+from .tagcodec import _get_varint, _put_varint, train_best_dict
 
 
 class _TagGraph:
@@ -601,16 +599,9 @@ class _TagStore:
                 "dict_bytes": 0,
             }
 
-        training = samples
-        dict_blob = None
-        if len(training) >= DICT_MIN_SAMPLES:
-            try:
-                dict_blob = zstd.train_dictionary(
-                    TAG_STORE_DICT_SIZE, training
-                ).as_bytes()
-            except zstd.ZstdError as e:
-                log.warning(f"Tag store: dictionary training failed ({e}).")
-        del samples, training
+        cdict = train_best_dict(samples, "Tag store")
+        dict_blob = cdict.as_bytes() if cdict else None
+        del samples, cdict
 
         cctx = zstd.ZstdCompressor(
             level=ZSTD_LEVEL,
