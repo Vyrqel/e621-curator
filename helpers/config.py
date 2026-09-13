@@ -149,9 +149,15 @@ _RATING_MASK = 0b11
 
 # ---------- Tag store ----------
 # Chunked, zstd-compressed tag list (see _TagStore in taggraph.py).
-TAG_CHUNK_SIZE = 8192  # rows per chunk
+# Packed (pre-compression) bytes per chunk. Bounds the work of one lookup
+# regardless of how long the tag names in that stretch of the list are.
+TAG_CHUNK_BYTES = 64 * 1024
 TAG_STORE_DICT_SIZE = 248 * 1024
-TAG_STORE_CACHE = 96  # decompressed chunks held in memory (LRU)
+# Decoded-chunk LRU budget, as a fraction of installed RAM (0.25% of 8 GB is
+# ~20 MB). Measured as Python heap footprint of the decoded rows, which runs
+# several times the packed size. The floor keeps small machines usable.
+TAG_STORE_CACHE_FRACTION = 0.0025
+TAG_STORE_CACHE_MIN_BYTES = 4 * 1024 * 1024
 
 # ---------- Progress bars / downloads ----------
 # right knob for a bar stepped per item.

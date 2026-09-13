@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -26,14 +27,15 @@ from .config import (
     DOWNLOAD_CHUNK,
     LOCAL_CSV_DIR,
     TAG_CATEGORIES,
-    TAG_CHUNK_SIZE,
+    TAG_CHUNK_BYTES,
     TAG_EXPORT_NAMES,
     TAG_EXPORT_PERIOD,
     TAG_EXPORT_RETRY_ATTEMPTS,
     TAG_EXPORT_RETRY_INTERVAL,
     TAG_GRAPH_TIMEOUT,
     TAG_MIN_POST_COUNT,
-    TAG_STORE_CACHE,
+    TAG_STORE_CACHE_FRACTION,
+    TAG_STORE_CACHE_MIN_BYTES,
     TAG_STORE_DICT_SIZE,
     TQDM_STEADY,
     USER_AGENT,
@@ -282,6 +284,35 @@ _tag_graph = _TagGraph()
 # decompress one chunk in isolation.
 
 
+def _physical_memory():
+    """Installed RAM in bytes, or None if the platform won't say."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def _tag_store_cache_budget():
+    mem = _physical_memory() or 8 * 1024**3
+    return max(TAG_STORE_CACHE_MIN_BYTES, int(mem * TAG_STORE_CACHE_FRACTION))
+
+
+def _rows_footprint(rows):
+    """Approximate Python heap cost of a decoded chunk.
+
+    Counts the list, each tuple and each name string. Categories are small
+    ints (interned by CPython); post counts mostly aren't, so they're counted.
+    """
+    size = sys.getsizeof(rows)
+    for name, _category, post_count in rows:
+        size += (
+            sys.getsizeof((name, 0, 0))
+            + sys.getsizeof(name)
+            + (sys.getsizeof(post_count) if post_count > 256 else 0)
+        )
+    return size
+
+
 class _TagStore:
     """Chunked, compressed view of the tag list.
 
@@ -301,7 +332,9 @@ class _TagStore:
         self._maxpc = []  # max post_count per chunk, to bound the ranking
         self._ids = []  # chunk id per position
         self._dctx = None
-        self._cache = collections.OrderedDict()  # chunk id -> decoded rows
+        self._cache = collections.OrderedDict()  # chunk id -> (rows, footprint)
+        self._cache_bytes = 0
+        self.cache_budget = _tag_store_cache_budget()
         self.chunk_count = 0
         self.tag_count = 0
         self.raw_bytes = 0
@@ -310,11 +343,18 @@ class _TagStore:
     # -- codec --
 
     @staticmethod
-    def _pack_chunk(rows):
-        """Front-code and serialize one chunk's rows. Input must be name-sorted."""
+    def _pack_chunks(rows, chunk_bytes):
+        """Front-code name-sorted rows into chunks of about `chunk_bytes`.
+
+        Yields (rows, raw) per chunk. A chunk closes on the first row that
+        takes it to or past the target, so chunks overshoot by at most one
+        row. Front-coding restarts at every chunk boundary.
+        """
+        batch = []
         out = bytearray()
         prev = ""
-        for name, category, post_count in rows:
+        for row in rows:
+            name, category, post_count = row
             shared = 0
             limit = min(len(prev), len(name))
             while shared < limit and prev[shared] == name[shared]:
@@ -326,11 +366,18 @@ class _TagStore:
             out += _put_varint(category)
             out += _put_varint(post_count)
             prev = name
-        return bytes(out)
+            batch.append(row)
+            if len(out) >= chunk_bytes:
+                yield batch, bytes(out)
+                batch = []
+                out = bytearray()
+                prev = ""
+        if batch:
+            yield batch, bytes(out)
 
     @staticmethod
     def _unpack_chunk(raw):
-        """Inverse of _pack_chunk. Returns [(name, category, post_count), ...].
+        """Inverse of one _pack_chunks chunk. Returns [(name, category, post_count), ...].
 
         The shared-prefix count is in characters, not bytes, so the slice of
         the previous name is taken before encoding — tags are mostly ASCII but
@@ -362,6 +409,7 @@ class _TagStore:
         self._maxpc = []
         self._ids = []
         self._cache.clear()
+        self._cache_bytes = 0
         self._dctx = None
         self.chunk_count = 0
         self.tag_count = 0
@@ -405,6 +453,7 @@ class _TagStore:
         with self.lock:
             self._loaded = False
             self._cache.clear()
+            self._cache_bytes = 0
 
     def is_empty(self):
         with self.lock:
@@ -417,7 +466,7 @@ class _TagStore:
         hit = self._cache.get(chunk_id)
         if hit is not None:
             self._cache.move_to_end(chunk_id)
-            return hit
+            return hit[0]
         with db() as conn:
             row = conn.execute(
                 "SELECT blob FROM tag_chunks WHERE id = ?", (chunk_id,)
@@ -425,9 +474,13 @@ class _TagStore:
         if not row:
             return []
         rows = self._unpack_chunk(self._dctx.decompress(bytes(row["blob"])))
-        self._cache[chunk_id] = rows
-        if len(self._cache) > TAG_STORE_CACHE:
-            self._cache.popitem(last=False)
+        footprint = _rows_footprint(rows)
+        self._cache[chunk_id] = (rows, footprint)
+        self._cache_bytes += footprint
+        # Evict oldest first, but never the chunk just decoded.
+        while self._cache_bytes > self.cache_budget and len(self._cache) > 1:
+            _, (_, evicted) = self._cache.popitem(last=False)
+            self._cache_bytes -= evicted
         return rows
 
     # -- queries --
@@ -516,12 +569,14 @@ class _TagStore:
                 "raw_bytes": self.raw_bytes,
                 "updated_at": self.updated_at,
                 "cached_chunks": len(self._cache),
+                "cache_bytes": self._cache_bytes,
+                "cache_budget": self.cache_budget,
             }
 
     # -- building --
 
     @classmethod
-    def build(cls, conn, row_iter, chunk_size=TAG_CHUNK_SIZE):
+    def build(cls, conn, row_iter, chunk_bytes=TAG_CHUNK_BYTES):
         """Rewrite tag_chunks + tag_store from name-sorted (name, cat, count).
 
         Two passes over the source: the first packs payloads to sample for
@@ -530,21 +585,11 @@ class _TagStore:
         less memory than holding 870k rows plus their payloads at once.
         """
 
-        def _chunks(rows):
-            batch = []
-            for row in rows:
-                batch.append(row)
-                if len(batch) >= chunk_size:
-                    yield batch
-                    batch = []
-            if batch:
-                yield batch
-
         samples = []
         total = 0
-        for batch in _chunks(row_iter()):
+        for batch, raw in cls._pack_chunks(row_iter(), chunk_bytes):
             total += len(batch)
-            samples.append(cls._pack_chunk(batch))
+            samples.append(raw)
         if not total:
             conn.execute("DELETE FROM tag_chunks")
             conn.execute("DELETE FROM tag_store")
@@ -579,8 +624,9 @@ class _TagStore:
 
         def _packed():
             nonlocal raw_bytes, compressed_bytes, chunk_count
-            for i, batch in enumerate(_chunks(row_iter())):
-                raw = cls._pack_chunk(batch)
+            for i, (batch, raw) in enumerate(
+                cls._pack_chunks(row_iter(), chunk_bytes)
+            ):
                 raw_bytes += len(raw)
                 blob = cctx.compress(raw)
                 compressed_bytes += len(blob)
@@ -812,12 +858,12 @@ def _download_exports(dest_dir, manifest):
             actual = _sha256_file(dest)
             if not entry["checksum"] or actual == entry["checksum"]:
                 log.info(
-                    f"Tag data: fetched {name}.csv.gz "
+                    f"Tag exports: fetched {name}.csv.gz "
                     f"({dest.stat().st_size / 1048576:.1f} MiB) via {tool}."
                 )
                 break
             log.warning(
-                f"Tag data: {name}.csv.gz checksum mismatch on attempt "
+                f"Tag exports: {name}.csv.gz checksum mismatch on attempt "
                 f"{attempt} (got {actual[:16]}, expected "
                 f"{entry['checksum'][:16]})."
             )
@@ -867,10 +913,10 @@ def enable_local_csv():
     global _local_csv
     _local_csv = True
     if _local_csv_paths() is not None:
-        log.info(f"Tag data: local CSV mode, using copies in {LOCAL_CSV_DIR}.")
+        log.info(f"Tag exports: local CSV mode, using copies in {LOCAL_CSV_DIR}.")
         return
     LOCAL_CSV_DIR.mkdir(exist_ok=True)
-    log.info(f"Tag data: local CSV mode, downloading exports to {LOCAL_CSV_DIR}.")
+    log.info(f"Tag exports: local CSV mode, downloading exports to {LOCAL_CSV_DIR}.")
     manifest = _fetch_export_manifest()
     _download_exports(LOCAL_CSV_DIR, manifest)
     _LOCAL_MANIFEST.write_text(json.dumps(manifest, indent=2))
@@ -897,7 +943,7 @@ def _export_sources(manifest, allow_download=True):
             paths = _download_exports(Path(tmp.name), manifest)
             origin = "download"
         except Exception as e:
-            log.warning(f"Tag data: download failed ({e}).")
+            log.warning(f"Tag exports: download failed ({e}).")
             if tmp is not None:
                 tmp.cleanup()
                 tmp = None
@@ -1007,7 +1053,7 @@ def refresh_tag_graph(force=False, allow_download=True):
         try:
             manifest = _fetch_export_manifest()
         except Exception as e:
-            log.warning(f"Tag data: manifest fetch failed ({e}).")
+            log.warning(f"Tag exports: manifest fetch failed ({e}).")
 
     stored = _stored_exports()
     if manifest and not force:
@@ -1018,19 +1064,19 @@ def refresh_tag_graph(force=False, allow_download=True):
         ]
         if len(unchanged) == len(TAG_EXPORT_NAMES):
             log.info(
-                f"Tag data: all {len(unchanged)} exports unchanged "
+                f"Tag exports: all {len(unchanged)} exports unchanged "
                 f"(newest stamp {manifest['tags']['updated_at']})."
             )
             return None
         log.info(
-            f"Tag data: {len(TAG_EXPORT_NAMES) - len(unchanged)} of "
+            f"Tag exports: {len(TAG_EXPORT_NAMES) - len(unchanged)} of "
             f"{len(TAG_EXPORT_NAMES)} exports changed; fetching all three."
         )
 
     with _export_sources(manifest, allow_download) as (paths, origin):
         if paths is None:
             log.warning(
-                f"Tag data: could not obtain the {', '.join(TAG_EXPORT_NAMES)} "
+                f"Tag exports: could not obtain the {', '.join(TAG_EXPORT_NAMES)} "
                 f"exports, and no local copies are in use. Download "
                 f"them from {DB_EXPORT_INDEX} into {LOCAL_CSV_DIR} (.csv or "
                 f".csv.gz) and start with --local-csv as a fallback. Running without alias, "
@@ -1038,7 +1084,7 @@ def refresh_tag_graph(force=False, allow_download=True):
             )
             return None
 
-        log.info(f"Tag data: ingesting from {origin}.")
+        log.info(f"Tag exports: ingesting from {origin}.")
         stats = _ingest_tag_data(paths)
 
     if manifest and origin == "download":
@@ -1054,7 +1100,7 @@ def _refresh_from_local_csv(force):
     """
     paths = _local_csv_paths()
     if paths is None:
-        log.warning(f"Tag data: local CSV mode, but {LOCAL_CSV_DIR} lacks a full set.")
+        log.warning(f"Tag exports: local CSV mode, but {LOCAL_CSV_DIR} lacks a full set.")
         return None
 
     manifest = _local_manifest()
@@ -1064,10 +1110,10 @@ def _refresh_from_local_csv(force):
             stored.get(n, {}).get("checksum") == manifest.get(n, {}).get("checksum")
             for n in TAG_EXPORT_NAMES
         ):
-            log.info("Tag data: local copies already ingested; skipping.")
+            log.info("Tag exports: local copies already ingested; skipping.")
             return None
 
-    log.info(f"Tag data: ingesting from {LOCAL_CSV_DIR}.")
+    log.info(f"Tag exports: ingesting from {LOCAL_CSV_DIR}.")
     stats = _ingest_tag_data(paths)
     if manifest and all(n in manifest for n in TAG_EXPORT_NAMES):
         _record_exports(manifest)
@@ -1078,7 +1124,7 @@ def _ingest_aliases(path):
     """Active alias pairs from the export, chains collapsed to a fixed point."""
     raw = {}
     rows = 0
-    for r in _read_export_rows(path, "Tag data: aliases"):
+    for r in _read_export_rows(path, "Tag aliases: reading tag_aliases export"):
         rows += 1
         if (r.get("status") or "").strip() != "active":
             continue
@@ -1087,7 +1133,7 @@ def _ingest_aliases(path):
         if ante and cons and ante != cons:
             raw[ante] = cons
     aliases = _resolve_alias_chains(raw)
-    log.info(f"Tag data: {rows} alias rows -> {len(aliases)} active, chain-resolved.")
+    log.info(f"Tag aliases: {rows} alias rows -> {len(aliases)} active, chain-resolved.")
     return aliases
 
 
@@ -1099,7 +1145,7 @@ def _ingest_implications(path, aliases):
     """
     edges = set()
     rows = 0
-    for r in _read_export_rows(path, "Tag data: implications"):
+    for r in _read_export_rows(path, "Tag implications: reading tag_implications export"):
         rows += 1
         if (r.get("status") or "").strip() != "active":
             continue
@@ -1111,7 +1157,7 @@ def _ingest_implications(path, aliases):
         cons = aliases.get(cons, cons)
         if ante != cons:
             edges.add((ante, cons))
-    log.info(f"Tag data: {rows} implication rows -> {len(edges)} active edges.")
+    log.info(f"Tag implications: {rows} implication rows -> {len(edges)} active edges.")
     return edges
 
 
@@ -1135,7 +1181,7 @@ def _ingest_tags_table(path, aliases):
     """
     kept = 0
     rows = 0
-    with _export_stream(path, "Tag data: tags") as (handle, tick):
+    with _export_stream(path, "Tag store: reading tags export") as (handle, tick):
         reader = csv.reader(handle)
         header = next(reader, None)
         if not header:
@@ -1193,7 +1239,7 @@ def _ingest_tags_table(path, aliases):
     _tag_store.invalidate()
 
     log.info(
-        f"Tag data: {rows} tag rows -> {kept} kept "
+        f"Tag store: {rows} tag rows -> {kept} kept "
         f"(post_count >= {TAG_MIN_POST_COUNT}, alias antecedents dropped); "
         f"packed into {built['chunks']} chunks, {built['raw_bytes'] / 1e6:.1f} MB "
         f"raw, {built['dict_bytes'] / 1024:.0f} KB dictionary."
@@ -1202,7 +1248,7 @@ def _ingest_tags_table(path, aliases):
         raw_bytes = built["raw_bytes"]
         new_bytes = built["compressed_bytes"]
         log.info(
-            f"Tag store: compressed {built['chunks']} chunk(s) "
+            f"Tag store: compressed {built['chunks']} chunk(s). "
             f"Avg bytes/tag: {raw_bytes / built['tags']:.1f} -> "
             f"{new_bytes / built['tags']:.1f} "
             f"({(1 - new_bytes / raw_bytes) * 100:.1f}% saved, "
@@ -1252,13 +1298,13 @@ def _ingest_tag_data(paths):
         "tags": tag_count,
     }
     log.info(
-        f"Tag data: stored {stats['aliases']} aliases and "
+        f"Tag graph: stored {stats['aliases']} aliases and "
         f"{stats['implications']} implications "
         f"({stats['aliases_bytes'] + stats['implications_bytes']} bytes of blob), "
         f"plus {stats['tags']} completable tags."
     )
     log.info(
-        f"Tag data: graph resident size is roughly "
+        f"Tag graph: resident size is roughly "
         f"{_estimate_graph_bytes(aliases, edges) / 1048576:.0f} MiB in memory."
     )
 
@@ -1348,14 +1394,14 @@ def _tag_graph_loop():
     e621's nightly job sometimes runs late, and each poll is one small JSON
     fetch, so waiting it out is cheaper than sleeping another full day.
     """
-    log.info("Tag data thread started.")
+    log.info("Tag export refresh thread started.")
     attempts_left = TAG_EXPORT_RETRY_ATTEMPTS
     while True:
-        log.info("Tag data: activating.")
+        log.info("Tag export refresh: activating.")
         try:
             changed = refresh_tag_graph() is not None
         except Exception as e:
-            log.error(f"Tag data: refresh failed: {e}")
+            log.error(f"Tag export refresh: failed: {e}")
             changed = False
 
         # Whether or not the export moved, diff the exhausted set against it:
@@ -1375,7 +1421,7 @@ def _tag_graph_loop():
 
         if _local_csv:
             # Nothing will ever change underneath us; no point polling.
-            log.info("Tag data: local CSV mode, thread going idle.")
+            log.info("Tag export refresh: local CSV mode, thread going idle.")
             return
 
         due_in = _seconds_until_next_export()
@@ -1388,22 +1434,22 @@ def _tag_graph_loop():
             attempts_left -= 1
             delay = TAG_EXPORT_RETRY_INTERVAL
             log.info(
-                f"Tag data: export overdue, retrying in "
+                f"Tag export refresh: export overdue, retrying in "
                 f"{delay // 60} min ({attempts_left} attempts left)."
             )
         else:
             attempts_left = TAG_EXPORT_RETRY_ATTEMPTS
-            log.warning("Tag data: retry ladder exhausted; backing off a full period.")
+            log.warning("Tag export refresh: retry ladder exhausted; backing off a full period.")
             delay = TAG_EXPORT_PERIOD
 
-        _log_next("Tag data", delay)
+        _log_next("Tag export refresh", delay)
         time.sleep(delay)
 
 
 def start_tag_graph_sync():
     t = threading.Thread(target=_tag_graph_loop, daemon=True, name="tag-data")
     t.start()
-    log.info("Tag data thread launched.")
+    log.info("Tag export refresh thread launched.")
 
 
 # ---------- Tag query matcher ----------
