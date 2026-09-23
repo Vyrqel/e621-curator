@@ -42,7 +42,15 @@ from helpers.tagcache import (
     resume_interrupted_refresh,
 )
 from helpers.taggraph import enable_local_csv, start_tag_graph_sync
-from helpers.userfiles import reconcile_additions_files, sync_additions_files
+from helpers.userfiles import (
+    append_to_blacklist,
+    find_additions_with_tag,
+    find_queries_with_tag,
+    reconcile_additions_files,
+    remove_additions_with_tag,
+    remove_queries_with_tag,
+    sync_additions_files,
+)
 
 # Imported for its side effects: importing the module is what registers the
 # routes on `app`. Without it the server starts and 404s on every path.
@@ -111,9 +119,16 @@ if __name__ == "__main__":
         "--purge",
         metavar="TAG",
         help="Permanently remove every seen post carrying TAG (aliases and "
-        "implications honored) from seen-history and the tag cache, then "
-        "exit. Asks for confirmation first. Only posts with cached tags can "
-        "be matched. Favorites are kept.",
+        "implications honored) from seen-history and the tag cache, and drop "
+        "TAG from queries.txt and both additions files/table, then exit. "
+        "Asks for confirmation first. Only posts with cached tags can be "
+        "matched. Favorites are kept.",
+    )
+    parser.add_argument(
+        "--blacklist",
+        metavar="TAGS",
+        help="Append TAGS as a new line in blacklist.txt, then exit. Quote "
+        "multi-tag clauses: --blacklist \"alcohol -solo\".",
     )
     args = parser.parse_args()
 
@@ -147,22 +162,35 @@ if __name__ == "__main__":
         )
         raise SystemExit(0)
 
+    if args.blacklist:
+        if append_to_blacklist(args.blacklist):
+            log.info(f"Added '{args.blacklist}' to blacklist.txt.")
+        else:
+            log.info(f"'{args.blacklist}' is already in blacklist.txt.")
+        raise SystemExit(0)
+
     if args.purge:
         init_db()
         ids, uncached = find_seen_posts_with_tag(args.purge)
+        queries = find_queries_with_tag(args.purge)
+        additions = find_additions_with_tag(args.purge)
         if uncached:
             log.warning(
                 f"{uncached} seen post(s) have no cached tags and can't be "
                 f"checked (run --refresh-tags to fill the cache)."
             )
-        if not ids:
-            log.info(f"No seen posts tagged '{args.purge}'.")
+        if not (ids or queries or additions):
+            log.info(f"Nothing tagged '{args.purge}' to purge.")
             raise SystemExit(0)
+        print(f"\nPurging '{args.purge}' will:")
+        print(f"  - remove {len(ids)} seen post(s) from history and the tag cache")
+        for q in queries:
+            print(f"  - delete query from queries.txt: {q}")
+        for tag, category in additions:
+            print(f"  - delete {category} addition: {tag}")
         print(
-            f"\n{len(ids)} seen post(s) are tagged '{args.purge}'.\n"
-            f"Purging removes them from seen-history and the tag cache. "
-            f"THIS IS IRREVERSIBLE — they will count as unseen and may come "
-            f"back up in review."
+            "THIS IS IRREVERSIBLE. Purged posts count as unseen and may come "
+            "back up in review unless the tag is blacklisted."
         )
         try:
             answer = input("Type 'purge' to confirm: ")
@@ -172,7 +200,12 @@ if __name__ == "__main__":
             log.info("Purge cancelled.")
             raise SystemExit(1)
         removed = purge_seen_posts(ids)
-        log.info(f"Purged {removed} seen post(s) tagged '{args.purge}'.")
+        remove_queries_with_tag(args.purge)
+        remove_additions_with_tag(args.purge)
+        log.info(
+            f"Purged '{args.purge}': {removed} seen post(s), "
+            f"{len(queries)} query line(s), {len(additions)} addition(s)."
+        )
         run_vacuum()
         raise SystemExit(0)
 
