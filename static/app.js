@@ -791,8 +791,8 @@ function renderSuggest(suggestions, fragment) {
       // highlight goes on the left half; accepting still inserts s.name.
       const label = s.alias_of
         ? `<span class="suggest-name is-alias">${highlight(s.alias_of, fragment)}</span>` +
-          `<span class="suggest-arrow">→</span>` +
-          `<span class="suggest-name">${escapeHtml(s.name)}</span>`
+        `<span class="suggest-arrow">→</span>` +
+        `<span class="suggest-name">${escapeHtml(s.name)}</span>`
         : `<span class="suggest-name">${highlight(s.name, fragment)}</span>`;
       return (
         `<div class="suggest-item" data-index="${i}" data-cat="${s.category}" role="option">` +
@@ -1034,7 +1034,7 @@ refreshStats();
 
 // ---------- Connection monitor ----------
 (function startConnectionMonitor() {
-  const INTERVAL = 4000;
+  const INTERVAL = 10000;
   const TIMEOUT = 3000;
   const dot = document.getElementById('conn-dot');
   const label = document.getElementById('conn-label');

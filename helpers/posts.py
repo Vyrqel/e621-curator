@@ -4,7 +4,7 @@ import time
 from .database import db
 from .e6api import _fetch_post_by_id, e621_unfavorite, fetch_posts
 from .runtime import log
-from .tagcodec import encode_tags
+from .tagcodec import decode_tags, encode_tags
 from .taggraph import _tag_graph
 
 
@@ -299,6 +299,58 @@ def purge_post(post_id):
         conn.execute("DELETE FROM favorites WHERE post_id = ?", (post_id,))
         conn.execute("DELETE FROM post_tags WHERE post_id = ?", (post_id,))
         conn.execute("DELETE FROM post_relations WHERE post_id = ?", (post_id,))
+
+
+def find_seen_posts_with_tag(tag):
+    """Seen post IDs whose cached tags include `tag` (alias-resolved, with
+    implications expanded, so purging `canine` catches posts storing `fox`).
+
+    Returns (matching_ids, uncached_count). Seen posts without a tag cache
+    row can't be checked and are counted instead.
+    """
+    tag = _tag_graph.canonical(tag.strip().lower())
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT s.post_id, t.tags_blob FROM seen s "
+            "LEFT JOIN post_tags t ON t.post_id = s.post_id"
+        ).fetchall()
+    matches, uncached = [], 0
+    for row in rows:
+        if row["tags_blob"] is None:
+            uncached += 1
+            continue
+        try:
+            tags_dict, _ = decode_tags(bytes(row["tags_blob"]))
+        except Exception:
+            uncached += 1
+            continue
+        flat = {t.lower() for ts in tags_dict.values() for t in ts}
+        if tag in _tag_graph.expand(flat):
+            matches.append(row["post_id"])
+    return matches, uncached
+
+
+def purge_seen_posts(post_ids):
+    """Drop seen-history, tag cache and relations for `post_ids`.
+
+    Favorites are left alone: removing them locally would just be undone by
+    the favorites sync, and a favorited post's cache row stays so override
+    filtering keeps working on it. Returns the number of seen rows removed.
+    """
+    removed = 0
+    with db() as conn:
+        for pid in post_ids:
+            removed += conn.execute(
+                "DELETE FROM seen WHERE post_id = ?", (pid,)
+            ).rowcount
+            if conn.execute(
+                "SELECT 1 FROM favorites WHERE post_id = ?", (pid,)
+            ).fetchone() is None:
+                conn.execute("DELETE FROM post_tags WHERE post_id = ?", (pid,))
+                conn.execute(
+                    "DELETE FROM post_relations WHERE post_id = ?", (pid,)
+                )
+    return removed
 
 
 def _is_locally_favorited(post_id):
