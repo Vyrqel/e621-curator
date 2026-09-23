@@ -1,3 +1,4 @@
+import hashlib
 import time
 import urllib.parse
 
@@ -23,18 +24,107 @@ def load_queries():
         return []
     queries = []
     for line in QUERIES_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("http"):
-            parsed = urllib.parse.urlparse(line)
-            params = urllib.parse.parse_qs(parsed.query)
-            tags = params.get("tags", [None])[0]
-            if tags:
-                queries.append(tags.lower())
-        else:
-            queries.append(line.lower())
+        tags = _query_line_tags(line)
+        if tags:
+            queries.append(tags)
     return queries
+
+
+def _query_line_tags(line):
+    """The lowercase tag string a queries.txt line stands for, or None for
+    comments, blanks and URLs without a `tags` parameter."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("http"):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(line).query)
+        tags = params.get("tags", [None])[0]
+        return tags.lower() if tags else None
+    return line.lower()
+
+
+def _has_positive_tag(tags, tag):
+    """True if the tag string requires `tag` (alias-resolved). Negated terms
+    don't count — `-alcohol` is a query that already avoids it."""
+    return any(
+        not t.startswith("-") and _tag_graph.canonical(t) == tag
+        for t in tags.split()
+    )
+
+
+def find_queries_with_tag(tag):
+    """Queries in queries.txt that require `tag`, for the purge preview."""
+    tag = _tag_graph.canonical(tag.strip().lower())
+    return [q for q in load_queries() if _has_positive_tag(q, tag)]
+
+
+def remove_queries_with_tag(tag):
+    """Delete every queries.txt line that requires `tag`, plus its progress
+    row. Comments and other lines are kept as-is. Returns the removed
+    queries."""
+    if not QUERIES_FILE.exists():
+        return []
+    tag = _tag_graph.canonical(tag.strip().lower())
+    kept, removed = [], []
+    for line in QUERIES_FILE.read_text(encoding="utf-8").splitlines():
+        tags = _query_line_tags(line)
+        if tags and _has_positive_tag(tags, tag):
+            removed.append(tags)
+        else:
+            kept.append(line)
+    if removed:
+        QUERIES_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        with db() as conn:
+            conn.executemany(
+                "DELETE FROM query_progress WHERE query_hash = ?",
+                [(hashlib.sha256(q.encode()).hexdigest(),) for q in removed],
+            )
+    return removed
+
+
+def find_additions_with_tag(tag):
+    """(tag, category) pairs in the additions files/table matching `tag`."""
+    tag = _tag_graph.canonical(tag.strip().lower())
+    found = set()
+    for category in ("artist", "character"):
+        for t in read_additions_file(category):
+            if _tag_graph.canonical(t) == tag:
+                found.add((t, category))
+    with db() as conn:
+        for row in conn.execute("SELECT tag, category FROM additions"):
+            if _tag_graph.canonical(row["tag"]) == tag:
+                found.add((row["tag"], row["category"]))
+    return sorted(found)
+
+
+def remove_additions_with_tag(tag):
+    """Drop `tag` from both additions files and the additions table.
+    Returns the (tag, category) pairs removed."""
+    found = find_additions_with_tag(tag)
+    with db() as conn:
+        for t, category in found:
+            remove_from_additions_file(t, category)
+            conn.execute("DELETE FROM additions WHERE tag = ?", (t,))
+    return found
+
+
+def append_to_blacklist(line):
+    """Append a clause line to blacklist.txt. Returns False if an identical
+    clause (same terms, any order) is already there."""
+    terms = line.lower().split()
+    if not terms:
+        return False
+    existing = [
+        sorted(("-" if neg else "") + pat for pat, neg in clause)
+        for clause in load_blacklist()
+    ]
+    if sorted(terms) in existing:
+        return False
+    text = BLACKLIST_FILE.read_text(encoding="utf-8") if BLACKLIST_FILE.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    BLACKLIST_FILE.write_text(text + " ".join(terms) + "\n", encoding="utf-8")
+    return True
 
 
 def load_blacklist():
