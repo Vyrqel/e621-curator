@@ -33,6 +33,7 @@ import logging
 
 from helpers.database import init_db, run_vacuum
 from helpers.maintenance import start_maintenance
+from helpers.posts import find_seen_posts_with_tag, purge_seen_posts
 from helpers.runtime import TqdmLoggingHandler, app, log
 from helpers.scanner import check_blacklist_change
 from helpers.tagcache import (
@@ -106,6 +107,14 @@ if __name__ == "__main__":
         "Combine with other flags (e.g. --rebuild-tag-data) to avoid hitting "
         "e621 while testing. Delete ./csv to pull fresh copies.",
     )
+    parser.add_argument(
+        "--purge",
+        metavar="TAG",
+        help="Permanently remove every seen post carrying TAG (aliases and "
+        "implications honored) from seen-history and the tag cache, then "
+        "exit. Asks for confirmation first. Only posts with cached tags can "
+        "be matched. Favorites are kept.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -136,6 +145,35 @@ if __name__ == "__main__":
             f"(+{result['db_added']}, -{result['db_removed']}); "
             f"{result['queries_added']} tag(s) appended to queries.txt"
         )
+        raise SystemExit(0)
+
+    if args.purge:
+        init_db()
+        ids, uncached = find_seen_posts_with_tag(args.purge)
+        if uncached:
+            log.warning(
+                f"{uncached} seen post(s) have no cached tags and can't be "
+                f"checked (run --refresh-tags to fill the cache)."
+            )
+        if not ids:
+            log.info(f"No seen posts tagged '{args.purge}'.")
+            raise SystemExit(0)
+        print(
+            f"\n{len(ids)} seen post(s) are tagged '{args.purge}'.\n"
+            f"Purging removes them from seen-history and the tag cache. "
+            f"THIS IS IRREVERSIBLE — they will count as unseen and may come "
+            f"back up in review."
+        )
+        try:
+            answer = input("Type 'purge' to confirm: ")
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer.strip().lower() != "purge":
+            log.info("Purge cancelled.")
+            raise SystemExit(1)
+        removed = purge_seen_posts(ids)
+        log.info(f"Purged {removed} seen post(s) tagged '{args.purge}'.")
+        run_vacuum()
         raise SystemExit(0)
 
     if args.rebuild_tag_data:
