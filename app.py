@@ -50,7 +50,6 @@ from helpers.userfiles import (
     reconcile_additions_files,
     remove_additions_with_tag,
     remove_queries_with_tag,
-    sync_additions_files,
 )
 
 # Imported for its side effects: importing the module is what registers the
@@ -101,14 +100,6 @@ if __name__ == "__main__":
         "using the graph, so it only means anything after a refresh.",
     )
     parser.add_argument(
-        "--sync-additions",
-        action="store_true",
-        help="Push the two additions files into the DB (replacing the "
-        "additions table wholesale, so hand-deleted entries go away) and "
-        "append any tags missing from queries.txt, then exit. queries.txt is "
-        "only added to, never rewritten.",
-    )
-    parser.add_argument(
         "--local-csv",
         action="store_true",
         help="Use local copies of the tag exports in ./csv instead of fetching "
@@ -151,16 +142,6 @@ if __name__ == "__main__":
     if args.vacuum:
         init_db()
         run_vacuum()
-        raise SystemExit(0)
-
-    if args.sync_additions:
-        init_db()
-        result = sync_additions_files()
-        log.info(
-            f"Additions sync: additions table now {result['db_rows']} row(s) "
-            f"(+{result['db_added']}, -{result['db_removed']}); "
-            f"{result['queries_added']} tag(s) appended to queries.txt"
-        )
         raise SystemExit(0)
 
     if args.blacklist:

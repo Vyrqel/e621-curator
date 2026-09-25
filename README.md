@@ -130,8 +130,12 @@ rating:e -solo           # explicit non-solo
 ```
 
 **additions_artists.txt / additions_characters.txt** — auto-generated as you
-click tag chips. Your "to consider tracking" lists; when you commit to one,
-move it into `queries.txt`. Known tags get a green checkmark on posts.
+click tag chips. Clicking a chip also adds the tag to `queries.txt`. Tracked
+tags get a green checkmark on posts, and a green addition can be clicked
+again to remove it (after confirming) from both the additions and
+`queries.txt`. Single-tag lines you write into `queries.txt` by hand are
+filed into the matching list on startup and after each tag-data refresh,
+using the categories from the tag export.
 
 ## Run
 
@@ -343,10 +347,6 @@ These exit without starting the server:
   the `refresh_progress` checkpoint.
 - `--no-resume` — discard that checkpoint. With `--refresh-tags`, sweeps from
   the top; on normal startup, skips the resume entirely.
-- `--sync-additions` — push both additions files into the DB (replacing the
-  `additions` table wholesale, so hand-deleted entries actually go away) and
-  append any tags missing from `queries.txt`. `queries.txt` is only appended
-  to, never rewritten.
 - `--vacuum` — reclaim free pages. Runs automatically after
   `--rebuild-tag-data` and `--refresh-tags`; this is the manual handle for
   everything else. Never runs while the server is up, which is why a migration
