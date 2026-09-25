@@ -29,7 +29,7 @@ from .store import (
     set_page1_empty,
 )
 from .taggraph import _tag_graph
-from .userfiles import _tag_matches, is_blacklisted
+from .userfiles import _tag_matches, is_blacklisted, load_addition_tags
 
 
 def _find_unseen_post(query, seen, blacklist, persist=True, reserved=None):
@@ -448,6 +448,14 @@ def _build_post_response(post, query, known, from_primed):
         ).fetchone()
 
     is_favorited = post_is_favorited(post) or fav_row is not None
+    additions = load_addition_tags()
+
+    def chip(tag):
+        return {
+            "tag": tag,
+            "known": tag.lower() in known,
+            "addition": tag.lower() in additions,
+        }
 
     return {
         "id": post["id"],
@@ -459,12 +467,8 @@ def _build_post_response(post, query, known, from_primed):
         "height": file_info["height"],
         "is_favorited": is_favorited,
         "from_primed": from_primed,
-        "artists": [
-            {"tag": a, "known": a.lower() in known}
-            for a in artists
-            if a not in ("conditional_dnp",)
-        ],
-        "characters": [{"tag": c, "known": c.lower() in known} for c in characters],
+        "artists": [chip(a) for a in artists if a not in ("conditional_dnp",)],
+        "characters": [chip(c) for c in characters],
         "rating": post.get("rating"),
         "score": post_score(post),
         "post_url": f"https://e621.net/posts/{post['id']}",

@@ -47,7 +47,8 @@ from .userfiles import (
     load_blacklist,
     load_known_tags,
     load_queries,
-    remove_from_additions_file,
+    remove_additions_with_tag,
+    remove_bare_query,
 )
 
 
@@ -602,17 +603,14 @@ def api_addition():
 
 @app.route("/api/addition/remove", methods=["POST"])
 def api_addition_remove():
-    """Remove a tag from the additions list (DB + text file)."""
-    data = request.json
-    tag = data["tag"].strip().lower()
-    category = data["category"]
-    with db() as conn:
-        conn.execute(
-            "DELETE FROM additions WHERE tag = ? AND category = ?",
-            (tag, category),
-        )
-    remove_from_additions_file(tag, category)
-    return jsonify({"ok": True})
+    """Remove a tag from the additions (DB + text files) and drop the bare
+    queries.txt line it added. Reports whether the tag is still known via
+    some other query, so the chip can render accordingly."""
+    tag = request.json["tag"].strip().lower()
+    removed = remove_additions_with_tag(tag)
+    queries = remove_bare_query(tag)
+    log.info(f"Removed addition '{tag}': {len(removed)} addition(s), {len(queries)} query line(s).")
+    return jsonify({"ok": True, "known": tag in load_known_tags()})
 
 
 @app.route("/api/stats")

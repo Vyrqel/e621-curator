@@ -43,6 +43,7 @@ from helpers.tagcache import (
 )
 from helpers.taggraph import enable_local_csv, start_tag_graph_sync
 from helpers.userfiles import (
+    adopt_bare_queries,
     append_to_blacklist,
     find_additions_with_tag,
     find_queries_with_tag,
@@ -233,6 +234,7 @@ if __name__ == "__main__":
     init_db()
     resume_interrupted_refresh(cancel=args.no_resume)
     reconcile_additions_files()
+    adopt_bare_queries()
     check_blacklist_change()
     start_maintenance(first=True)
     start_tag_graph_sync()

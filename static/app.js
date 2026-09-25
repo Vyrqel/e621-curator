@@ -84,7 +84,39 @@ function showLoading() {
   els.meta.hidden = true;
 }
 
+// ---------- Two-step confirm ----------
+// The first call arms `el` (runs `show`, adds the warn style) and returns
+// false; a second call on the same element within 3s returns true. Timing
+// out or clicking anywhere else reverts it via `restore`.
+let armed = null;
+
+function disarm() {
+  if (!armed) return;
+  const a = armed;
+  armed = null;
+  clearTimeout(a.timer);
+  a.el.classList.remove("btn-confirm");
+  a.restore();
+}
+
+function confirmStep(el, show, restore) {
+  if (armed && armed.el === el) {
+    disarm();
+    return true;
+  }
+  disarm();
+  show();
+  el.classList.add("btn-confirm");
+  armed = { el, restore, timer: setTimeout(disarm, 3000) };
+  return false;
+}
+
+document.addEventListener("click", (e) => {
+  if (armed && !armed.el.contains(e.target)) disarm();
+}, true);
+
 function setFavoriteState(isFavorited) {
+  if (armed && armed.el === els.btnFav) disarm();
   if (isFavorited) {
     els.btnFav.classList.add("is-favorited");
     els.favLabel.textContent = "favorited";
@@ -104,7 +136,12 @@ function renderTags(container, tagList, category) {
     const el = document.createElement("span");
     el.className = "tag";
     el.textContent = t.tag;
-    if (t.known) {
+    if (t.addition) {
+      // Green like other tracked tags, but still clickable to remove
+      el.classList.add("known", "addition");
+      el.title = `In ${category} additions — click to remove (asks to confirm)`;
+      el.addEventListener("click", () => toggleAddition(el, t.tag, category));
+    } else if (t.known) {
       el.classList.add("known");
       el.title = "Already tracked";
     } else {
@@ -116,9 +153,13 @@ function renderTags(container, tagList, category) {
 }
 
 async function toggleAddition(el, tag, category) {
-  if (el.classList.contains("known")) return;
-
-  const isAdded = el.classList.contains("added");
+  const isAdded = el.classList.contains("added") || el.classList.contains("addition");
+  if (el.classList.contains("known") && !isAdded) return;
+  if (isAdded && !confirmStep(
+    el,
+    () => { el.textContent = `${tag} · remove?`; },
+    () => { el.textContent = tag; },
+  )) return;
   const endpoint = isAdded ? "/api/addition/remove" : "/api/addition";
 
   try {
@@ -131,7 +172,14 @@ async function toggleAddition(el, tag, category) {
 
     if (isAdded) {
       if (data.ok) {
-        el.classList.remove("added");
+        el.classList.remove("added", "addition", "known");
+        if (data.known) {
+          // Still tracked through some other query line
+          el.classList.add("known");
+          el.title = "Already tracked";
+        } else {
+          el.title = `Click to add to ${category} additions (click again to remove)`;
+        }
         refreshStats();
       }
     } else {
@@ -667,6 +715,11 @@ async function goBack() {
 async function toggleFavorite() {
   if (!current) return;
   const isFavorited = els.btnFav.classList.contains("is-favorited");
+  if (isFavorited && !confirmStep(
+    els.btnFav,
+    () => { els.favLabel.textContent = "unfavorite?"; },
+    () => { els.favLabel.textContent = "favorited"; },
+  )) return;
   const endpoint = isFavorited ? "/api/unfavorite" : "/api/favorite";
   try {
     const body = { post_id: current.id };
@@ -992,28 +1045,13 @@ refreshStats();
 // ---------- Force rescan button (confirm pattern) ----------
 (function initRescanButton() {
   const btn = document.getElementById('btn-rescan');
-  let confirmPending = false;
-  let revertTimer = null;
-
-  function resetBtn() {
-    confirmPending = false;
-    clearTimeout(revertTimer);
-    btn.textContent = '↺';
-    btn.classList.remove('btn-confirm');
-  }
 
   btn.addEventListener('click', async () => {
-    if (!confirmPending) {
-      // First click: enter confirm state
-      confirmPending = true;
-      btn.textContent = 'confirm?';
-      btn.classList.add('btn-confirm');
-      // Auto-revert after 3 seconds if no second click
-      revertTimer = setTimeout(resetBtn, 3000);
-      return;
-    }
-    // Second click: fire
-    resetBtn();
+    if (!confirmStep(
+      btn,
+      () => { btn.textContent = 'confirm?'; },
+      () => { btn.textContent = '↺'; },
+    )) return;
     btn.disabled = true;
     btn.textContent = '…';
     try {
@@ -1025,11 +1063,6 @@ refreshStats();
       btn.textContent = '↺';
     }
   });
-
-  // Clicking anywhere else while confirm is pending reverts the button
-  document.addEventListener('click', (e) => {
-    if (confirmPending && e.target !== btn) resetBtn();
-  }, true);
 })();
 
 // ---------- Connection monitor ----------
