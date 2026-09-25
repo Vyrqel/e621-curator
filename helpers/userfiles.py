@@ -214,11 +214,44 @@ def read_additions_file(category):
     }
 
 
+def append_to_queries_file(tags):
+    """Append tags to queries.txt. Additive only.
+
+    A tag already present as a bare positive tag in any existing query is
+    skipped. Returns the tags actually appended.
+    """
+    existing = set()
+    for query in load_queries():
+        for token in query.split():
+            token = token.strip().lower()
+            if token and not token.startswith("-") and ":" not in token:
+                existing.add(token)
+        existing.add(query.strip().lower())
+
+    new_lines = []
+    for tag in tags:
+        tag = tag.strip().lower()
+        if tag and tag not in existing:
+            existing.add(tag)
+            new_lines.append(tag)
+    if new_lines:
+        if QUERIES_FILE.exists():
+            current = QUERIES_FILE.read_text(encoding="utf-8")
+        else:
+            current = "# queries.txt\n"
+        if current and not current.endswith("\n"):
+            current += "\n"
+        QUERIES_FILE.write_text(current + "\n".join(new_lines) + "\n", encoding="utf-8")
+    return new_lines
+
+
 def append_to_additions_file(tag, category):
-    """Append a tag to the appropriate additions file (skips if already present)."""
+    """Append a tag to the appropriate additions file (skips if already
+    present), and to queries.txt so it's served without waiting for a sync."""
     path = _additions_file(category)
     if path is None:
         return
+    append_to_queries_file([tag])
     existing = read_additions_file(category)
     if tag.lower() in existing:
         return
@@ -227,7 +260,7 @@ def append_to_additions_file(tag, category):
         header = (
             f"# additions_{category}s.txt\n"
             f"# {category}s flagged from tag clicks during curation.\n"
-            f"# Move entries to queries.txt as new search queries when ready.\n"
+            f"# Entries are added to queries.txt automatically.\n"
             f"# One tag per line. Lines starting with # are comments.\n\n"
         )
         path.write_text(header, encoding="utf-8")
@@ -322,24 +355,7 @@ def sync_additions_files():
     db_removed = len(set(old) - seen)
     db_added = len(seen - set(old))
 
-    # queries.txt — additive only
-    existing = set()
-    for query in load_queries():
-        for token in query.split():
-            token = token.strip().lower()
-            if token and not token.startswith("-") and ":" not in token:
-                existing.add(token)
-        existing.add(query.strip().lower())
-
-    new_lines = [tag for tag, _ in file_tags if tag not in existing]
-    if new_lines:
-        if QUERIES_FILE.exists():
-            current = QUERIES_FILE.read_text(encoding="utf-8")
-        else:
-            current = "# queries.txt\n"
-        if current and not current.endswith("\n"):
-            current += "\n"
-        QUERIES_FILE.write_text(current + "\n".join(new_lines) + "\n", encoding="utf-8")
+    new_lines = append_to_queries_file([tag for tag, _ in file_tags])
 
     return {
         "db_rows": len(file_tags),
