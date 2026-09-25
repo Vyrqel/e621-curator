@@ -33,6 +33,7 @@ from .store import (
     get_primed_queries,
     get_reserved_ids,
     get_seen_ids,
+    query_hash,
     release_post,
     reserve_posts,
     take_abandoned_reservation,
@@ -632,9 +633,17 @@ def api_stats():
         rel_pool_count = conn.execute(
             "SELECT COUNT(*) FROM post_relations WHERE pools != ''"
         ).fetchone()[0]
-        primed_count = conn.execute(
-            "SELECT COALESCE(SUM(new_posts_found), 0) FROM query_progress WHERE exhausted = 0 AND new_posts_found > 0"
-        ).fetchone()[0]
+        # Only count queries still in queries.txt — /api/next ignores primed
+        # rows for removed queries, so counting them shows posts it won't serve.
+        active = {query_hash(q) for q in load_queries()}
+        primed_count = sum(
+            row["new_posts_found"]
+            for row in conn.execute(
+                "SELECT query_hash, new_posts_found FROM query_progress "
+                "WHERE exhausted = 0 AND new_posts_found > 0"
+            )
+            if row["query_hash"] in active
+        )
     tag_count = _tag_store.count()
     return jsonify({
         "seen": seen_count,
