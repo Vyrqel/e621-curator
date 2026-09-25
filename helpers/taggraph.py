@@ -1300,6 +1300,10 @@ def _ingest_tag_data(paths):
     )
 
     canonicalize_additions()
+    # Now that categories are known, file hand-written query tags too
+    from .userfiles import adopt_bare_queries
+
+    adopt_bare_queries()
     return stats
 
 

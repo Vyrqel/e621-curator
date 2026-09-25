@@ -11,7 +11,7 @@ from .config import (
 )
 from .database import db
 from .runtime import log
-from .taggraph import _tag_graph
+from .taggraph import _tag_graph, _tag_store
 
 
 def load_queries():
@@ -80,6 +80,37 @@ def remove_queries_with_tag(tag):
                 [(hashlib.sha256(q.encode()).hexdigest(),) for q in removed],
             )
     return removed
+
+
+def remove_bare_query(tag):
+    """Delete queries.txt lines that are exactly `tag` (alias-resolved), plus
+    their progress rows — the lines append_to_queries_file writes. Compound
+    queries that merely mention the tag are left alone. Returns the removed
+    queries."""
+    if not QUERIES_FILE.exists():
+        return []
+    tag = _tag_graph.canonical(tag.strip().lower())
+    kept, removed = [], []
+    for line in QUERIES_FILE.read_text(encoding="utf-8").splitlines():
+        tags = _query_line_tags(line)
+        if tags and len(tags.split()) == 1 and _tag_graph.canonical(tags) == tag:
+            removed.append(tags)
+        else:
+            kept.append(line)
+    if removed:
+        QUERIES_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        with db() as conn:
+            conn.executemany(
+                "DELETE FROM query_progress WHERE query_hash = ?",
+                [(hashlib.sha256(q.encode()).hexdigest(),) for q in removed],
+            )
+    return removed
+
+
+def load_addition_tags():
+    """Tags in either additions file, as written and alias-canonical."""
+    tags = read_additions_file("artist") | read_additions_file("character")
+    return tags | {_tag_graph.canonical(t) for t in tags}
 
 
 def find_additions_with_tag(tag):
@@ -315,6 +346,52 @@ def reconcile_additions_files():
             f"Reconciled additions files: +{missing_artists} artists, "
             f"+{missing_characters} characters"
         )
+
+
+def adopt_bare_queries(dry_run=False):
+    """Adopt hand-written single-tag queries into the additions.
+
+    A queries.txt line that's one bare tag, isn't already an addition, and
+    is an artist or character tag per the tag store gets filed under that
+    category (DB + text file), so its chip can be removed like any other
+    addition. Anything else — compound queries, metatags, general tags,
+    tags the store doesn't know — is left alone. No-op while the tag store
+    is empty. Returns the adopted (tag, category) pairs.
+    """
+    if _tag_store.is_empty():
+        return []
+    additions = load_addition_tags()
+    adopted = []
+    for query in load_queries():
+        if len(query.split()) != 1 or query.startswith("-") or ":" in query or "*" in query:
+            continue
+        tag = _tag_graph.canonical(query)
+        if query in additions or tag in additions:
+            continue
+        info = _tag_store.get(tag)
+        if info is None:
+            continue
+        category = TAG_CATEGORIES[info[0]]
+        if category not in ("artist", "character"):
+            continue
+        adopted.append((tag, category))
+        additions.add(tag)
+    if dry_run or not adopted:
+        return adopted
+    now = int(time.time())
+    with db() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO additions (tag, category, added_at) VALUES (?, ?, ?)",
+            [(tag, category, now) for tag, category in adopted],
+        )
+    for tag, category in adopted:
+        append_to_additions_file(tag, category)
+    log.info(
+        f"Adopted {len(adopted)} bare query tag(s) into additions: "
+        + ", ".join(f"{t} ({c})" for t, c in adopted[:20])
+        + (" …" if len(adopted) > 20 else "")
+    )
+    return adopted
 
 
 def sync_additions_files():
