@@ -278,7 +278,7 @@ def append_to_queries_file(tags):
 
 def append_to_additions_file(tag, category):
     """Append a tag to the appropriate additions file (skips if already
-    present), and to queries.txt so it's served without waiting for a sync."""
+    present), and to queries.txt so it's served right away."""
     path = _additions_file(category)
     if path is None:
         return
@@ -392,54 +392,6 @@ def adopt_bare_queries(dry_run=False):
         + (" …" if len(adopted) > 20 else "")
     )
     return adopted
-
-
-def sync_additions_files():
-    """Push the two additions files into the DB and queries.txt.
-
-    Direction is file -> everything else; the files are the source of truth.
-
-      * additions table: replaced wholesale with the file contents, so a tag
-        deleted from a file by hand disappears from the DB too (this is the
-        handle for undoing accidental additions without the sqlite CLI).
-        `added_at` is preserved for tags that survive the replace.
-      * queries.txt: additive only. Any tag not already present as a bare
-        positive tag in an existing query gets appended; nothing is removed
-        or rewritten.
-
-    Returns a dict summary.
-    """
-    file_tags = []  # [(tag, category)] in file order, artists first
-    seen = set()
-    for category in ("artist", "character"):
-        for tag in sorted(read_additions_file(category)):
-            if tag in seen:
-                continue
-            seen.add(tag)
-            file_tags.append((tag, category))
-
-    now = int(time.time())
-    with db() as conn:
-        old = {
-            row["tag"]: row["added_at"]
-            for row in conn.execute("SELECT tag, added_at FROM additions")
-        }
-        conn.execute("DELETE FROM additions")
-        conn.executemany(
-            "INSERT INTO additions (tag, category, added_at) VALUES (?, ?, ?)",
-            [(tag, cat, old.get(tag, now)) for tag, cat in file_tags],
-        )
-    db_removed = len(set(old) - seen)
-    db_added = len(seen - set(old))
-
-    new_lines = append_to_queries_file([tag for tag, _ in file_tags])
-
-    return {
-        "db_rows": len(file_tags),
-        "db_added": db_added,
-        "db_removed": db_removed,
-        "queries_added": len(new_lines),
-    }
 
 
 def _tag_matches(pattern, post_tags):
