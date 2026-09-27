@@ -2,6 +2,7 @@ import random
 import threading
 
 import zstandard as zstd
+from tqdm import tqdm
 
 from .config import (
     _BITS_RATING,
@@ -13,6 +14,7 @@ from .config import (
     DICT_SEARCH_MAX_BYTES,
     DICT_SEARCH_MIN_BYTES,
     TAG_CATEGORIES,
+    TQDM_STEADY,
     ZSTD_LEVEL,
 )
 from .database import db
@@ -197,17 +199,33 @@ def train_best_dict(samples, label):
     size = DICT_SEARCH_MIN_BYTES
     misses = 0
     tried = []
-    while size <= cap and misses < 2:
-        try:
-            cost = _score(zstd.train_dictionary(size, train))
-        except zstd.ZstdError:
-            break  # too little data for this size; larger won't train either
-        tried.append(f"{size // 1024}K={cost / 1e6:.2f}MB")
-        if cost < best_cost:
-            best_size, best_cost, misses = size, cost, 0
-        else:
-            misses += 1
-        size *= 2
+    # The search is the slow step and the size count isn't fixed (it stops
+    # early on two misses), so the bar's total is only the upper bound.
+    n_sizes = 0
+    probe = size
+    while probe <= cap:
+        n_sizes += 1
+        probe *= 2
+    with tqdm(
+        total=n_sizes,
+        desc=f"{label}: searching dictionary sizes",
+        unit="size",
+        leave=False,
+        **TQDM_STEADY,
+    ) as bar:
+        while size <= cap and misses < 2:
+            bar.set_postfix_str(f"training {size // 1024}K")
+            try:
+                cost = _score(zstd.train_dictionary(size, train))
+            except zstd.ZstdError:
+                break  # too little data for this size; larger won't train either
+            tried.append(f"{size // 1024}K={cost / 1e6:.2f}MB")
+            if cost < best_cost:
+                best_size, best_cost, misses = size, cost, 0
+            else:
+                misses += 1
+            size *= 2
+            bar.update()
 
     log.info(
         f"{label}: dictionary search over {len(samples)} sample(s): "
@@ -216,6 +234,7 @@ def train_best_dict(samples, label):
     if not best_size:
         log.info(f"{label}: no dictionary beats dictionary-less; going without.")
         return None
+    log.info(f"{label}: retraining {best_size // 1024}K dictionary on all samples.")
     try:
         cdict = zstd.train_dictionary(best_size, samples)
     except zstd.ZstdError as e:

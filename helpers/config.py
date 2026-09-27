@@ -134,6 +134,12 @@ TAG_CATEGORIES = (
 )
 
 ZSTD_LEVEL = 19
+# Long-distance matching window for the whole-blob tag graph (see
+# _TagGraph._pack). Level 19's default window is 8 MB (log 23); the graph
+# payloads are ~2 MB today, so this buys nothing yet — it's headroom for the
+# day the alias/implication exports outgrow that window. Decompression of a
+# window this size needs max_window_size raised to match (see _unpack).
+ZSTD_LONG_WINDOW_LOG = 27  # 128 MiB
 DICT_MIN_SAMPLES = 64  # below this, training is pointless — go dictionary-less
 
 # Dictionary size is searched, not fixed (see train_best_dict in tagcodec.py).

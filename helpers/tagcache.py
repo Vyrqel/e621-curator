@@ -533,9 +533,6 @@ def retrain_tag_dict():
         # anyway. Tags are also re-reduced against the current implication
         # graph, so a graph refresh shrinks old blobs too.
         payloads = {}
-        old_bytes = 0
-        old_cdict = _tag_dicts.current()
-        old_dict_bytes = len(old_cdict.as_bytes()) if old_cdict else 0
         errors = 0
         for r in tqdm(
             rows,
@@ -545,7 +542,6 @@ def retrain_tag_dict():
             **TQDM_STEADY,
         ):
             blob = bytes(r["tags_blob"])
-            old_bytes += len(blob)
             try:
                 tags_dict, rating = _decode_raw_v3(_decompress_blob(blob))
                 tags_dict = _tag_graph.reduce(tags_dict)
@@ -631,24 +627,24 @@ def retrain_tag_dict():
         # Force the manager to reload committed state on next use.
         _tag_dicts._loaded = False
 
-        new_bytes = sum(len(b) for b, _ in rewritten)
+        # Compared against the uncompressed payloads, like the tag store's
+        # log line. The dictionary is part of the storage cost, so it counts
+        # on the compressed side.
+        raw_bytes = sum(len(raw) for raw, _ in payloads.values())
         new_dict_bytes = len(new_dict.as_bytes()) if new_dict else 0
+        new_bytes = sum(len(b) for b, _ in rewritten) + new_dict_bytes
         n = len(rewritten)
         stats = {
             "posts": n,
-            "old_avg": old_bytes / n,
+            "raw_avg": raw_bytes / n,
             "new_avg": new_bytes / n,
         }
-        # The dictionary is part of the storage cost; comparing blob bytes
-        # alone makes a smaller dictionary look like a regression.
-        old_total = old_bytes + old_dict_bytes
-        new_total = new_bytes + new_dict_bytes
         log.info(
             f"Post tag cache retrain: rewrote {n} blob(s). "
-            f"Avg bytes/post: {stats['old_avg']:.1f} -> {stats['new_avg']:.1f}; "
-            f"dictionary {old_dict_bytes} -> {new_dict_bytes} bytes; "
-            f"total {old_total} -> {new_total} bytes "
-            f"({(1 - new_total / old_total) * 100:.1f}% saved)."
+            f"Avg bytes/post: {stats['raw_avg']:.1f} -> {stats['new_avg']:.1f} "
+            f"({(1 - new_bytes / raw_bytes) * 100:.1f}% saved, "
+            f"total {raw_bytes} -> {new_bytes} bytes incl. "
+            f"{new_dict_bytes}-byte dictionary)."
         )
         return stats
 

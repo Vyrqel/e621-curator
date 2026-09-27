@@ -38,6 +38,7 @@ from .config import (
     TQDM_STEADY,
     USER_AGENT,
     ZSTD_LEVEL,
+    ZSTD_LONG_WINDOW_LOG,
 )
 from .database import db, run_vacuum
 from .e6api import _session, rate_limit
@@ -71,7 +72,10 @@ class _TagGraph:
     def _pack(pairs):
         """Serialize (antecedent, consequent) pairs to a compressed blob."""
         text = "\n".join(f"{a}\t{c}" for a, c in sorted(pairs))
-        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        params = zstd.ZstdCompressionParameters.from_level(
+            ZSTD_LEVEL, window_log=ZSTD_LONG_WINDOW_LOG, enable_ldm=True
+        )
+        cctx = zstd.ZstdCompressor(compression_params=params)
         return cctx.compress(text.encode("utf-8"))
 
     @staticmethod
@@ -79,7 +83,8 @@ class _TagGraph:
         """Inverse of _pack. Returns a list of (antecedent, consequent)."""
         if not blob:
             return []
-        dctx = zstd.ZstdDecompressor()
+        # Older blobs predate long mode; a raised ceiling still reads them.
+        dctx = zstd.ZstdDecompressor(max_window_size=1 << ZSTD_LONG_WINDOW_LOG)
         text = dctx.decompress(bytes(blob)).decode("utf-8")
         out = []
         for line in text.split("\n"):
@@ -574,20 +579,32 @@ class _TagStore:
     # -- building --
 
     @classmethod
-    def build(cls, conn, row_iter, chunk_bytes=TAG_CHUNK_BYTES):
+    def build(cls, conn, row_iter, chunk_bytes=TAG_CHUNK_BYTES, total_rows=None):
         """Rewrite tag_chunks + tag_store from name-sorted (name, cat, count).
 
         Two passes over the source: the first packs payloads to sample for
         dictionary training, the second packs again and compresses. Packing is
         cheap relative to zstd level 19, and re-walking a temp table costs far
         less memory than holding 870k rows plus their payloads at once.
+
+        total_rows, if given, sizes the first pass's progress bar. The
+        rows come back deduplicated, so it can overshoot slightly.
         """
 
         samples = []
         total = 0
-        for batch, raw in cls._pack_chunks(row_iter(), chunk_bytes):
-            total += len(batch)
-            samples.append(raw)
+        with tqdm(
+            total=total_rows,
+            desc="Tag store: sorting and packing chunks (pass 1/2)",
+            unit="tag",
+            unit_scale=True,
+            leave=False,
+            **TQDM_STEADY,
+        ) as bar:
+            for batch, raw in cls._pack_chunks(row_iter(), chunk_bytes):
+                total += len(batch)
+                samples.append(raw)
+                bar.update(len(batch))
         if not total:
             conn.execute("DELETE FROM tag_chunks")
             conn.execute("DELETE FROM tag_store")
@@ -601,6 +618,7 @@ class _TagStore:
 
         cdict = train_best_dict(samples, "Tag store")
         dict_blob = cdict.as_bytes() if cdict else None
+        n_chunks = len(samples)
         del samples, cdict
 
         cctx = zstd.ZstdCompressor(
@@ -616,7 +634,14 @@ class _TagStore:
         def _packed():
             nonlocal raw_bytes, compressed_bytes, chunk_count
             for i, (batch, raw) in enumerate(
-                cls._pack_chunks(row_iter(), chunk_bytes)
+                tqdm(
+                    cls._pack_chunks(row_iter(), chunk_bytes),
+                    total=n_chunks,
+                    desc="Tag store: compressing chunks (pass 2/2)",
+                    unit="chunk",
+                    leave=False,
+                    **TQDM_STEADY,
+                )
             ):
                 raw_bytes += len(raw)
                 blob = cctx.compress(raw)
@@ -1009,6 +1034,7 @@ def _read_export_rows(path, desc):
             if not i & _EXPORT_PROGRESS_MASK:
                 tick()
             yield row
+        tick()
 
 
 def _resolve_alias_chains(raw_map):
@@ -1172,60 +1198,73 @@ def _ingest_tags_table(path, aliases):
     """
     kept = 0
     rows = 0
-    with _export_stream(path, "Tag store: reading tags export") as (handle, tick):
-        reader = csv.reader(handle)
-        header = next(reader, None)
-        if not header:
-            raise RuntimeError("tags export is empty")
+    with db() as conn:
+        conn.execute(
+            "CREATE TEMP TABLE tag_sort ("
+            "  name TEXT PRIMARY KEY, category INTEGER, post_count INTEGER"
+            ") WITHOUT ROWID"
+        )
         try:
-            i_name = header.index("name")
-            i_cat = header.index("category")
-            i_count = header.index("post_count")
-        except ValueError as e:
-            raise RuntimeError(f"unexpected tags export header {header}: {e}")
-
-        def _rows():
-            nonlocal kept, rows
-            for row in reader:
-                rows += 1
-                if not rows & _EXPORT_PROGRESS_MASK:
-                    tick()
+            # Only the read happens under the export's progress bar. The build
+            # below runs well past the end of the file, and leaving the bar open
+            # over it made it look frozen just short of 100%.
+            with _export_stream(path, "Tag store: reading tags export") as (
+                handle,
+                tick,
+            ):
+                reader = csv.reader(handle)
+                header = next(reader, None)
+                if not header:
+                    raise RuntimeError("tags export is empty")
                 try:
-                    count = int(row[i_count])
-                    category = int(row[i_cat])
-                except (ValueError, IndexError):
-                    continue
-                if count < TAG_MIN_POST_COUNT:
-                    continue
-                name = row[i_name].strip().lower()
-                if not name or name in aliases:
-                    continue
-                if not 0 <= category < len(TAG_CATEGORIES):
-                    continue  # a category we don't have a slot for
-                kept += 1
-                yield (name, category, count)
+                    i_name = header.index("name")
+                    i_cat = header.index("category")
+                    i_count = header.index("post_count")
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"unexpected tags export header {header}: {e}"
+                    )
 
-        with db() as conn:
-            conn.execute(
-                "CREATE TEMP TABLE tag_sort ("
-                "  name TEXT PRIMARY KEY, category INTEGER, post_count INTEGER"
-                ") WITHOUT ROWID"
-            )
-            try:
+                def _rows():
+                    nonlocal kept, rows
+                    for row in reader:
+                        rows += 1
+                        if not rows & _EXPORT_PROGRESS_MASK:
+                            tick()
+                        try:
+                            count = int(row[i_count])
+                            category = int(row[i_cat])
+                        except (ValueError, IndexError):
+                            continue
+                        if count < TAG_MIN_POST_COUNT:
+                            continue
+                        name = row[i_name].strip().lower()
+                        if not name or name in aliases:
+                            continue
+                        if not 0 <= category < len(TAG_CATEGORIES):
+                            continue  # a category we don't have a slot for
+                        kept += 1
+                        yield (name, category, count)
+
                 conn.executemany(
                     "INSERT OR REPLACE INTO tag_sort (name, category, post_count) "
                     "VALUES (?, ?, ?)",
                     _rows(),
                 )
+                tick()
 
-                def _sorted_rows():
-                    return conn.execute(
-                        "SELECT name, category, post_count FROM tag_sort ORDER BY name"
-                    )
+            log.info(
+                f"Tag store: read {rows} tag rows, {kept} kept; building chunks."
+            )
 
-                built = _TagStore.build(conn, _sorted_rows)
-            finally:
-                conn.execute("DROP TABLE IF EXISTS temp.tag_sort")
+            def _sorted_rows():
+                return conn.execute(
+                    "SELECT name, category, post_count FROM tag_sort ORDER BY name"
+                )
+
+            built = _TagStore.build(conn, _sorted_rows, total_rows=kept)
+        finally:
+            conn.execute("DROP TABLE IF EXISTS temp.tag_sort")
 
     _tag_store.invalidate()
 
