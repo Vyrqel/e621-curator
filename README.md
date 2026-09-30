@@ -331,7 +331,8 @@ been aliased with its current name.
 
 These exit without starting the server:
 
-- `--rebuild-tag-data` — re-ingest the tags/alias/implication exports, then
+- `--rebuild-tag-data` — re-ingest the tags/alias/implication exports (if
+  e621 has published newer ones), then
   retrain the zstd dictionary and rewrite every tag blob against it, with full
   logs. Reach for this when the graph looks wrong or after a batch of tag edits
   land upstream.
@@ -339,7 +340,9 @@ These exit without starting the server:
   The two halves are deliberately not separately runnable: the retrain
   re-reduces tags against the current implication graph, so doing it before a
   refresh just means doing it again afterwards. The graph download is the only
-  part that touches the network; the rewrite is purely local.
+  part that touches the network, and it is skipped when the stored exports
+  already match e621's latest (they're published about once a day); the
+  rewrite is purely local and always runs.
 
 - `--refresh-tags` — re-fetch tags for every locally-referenced post (seen and
   favorites), overwriting the cache and purging posts confirmed gone from
