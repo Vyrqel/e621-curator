@@ -705,13 +705,17 @@ def rebuild_tag_data(allow_download=True):
     Exposed as `--rebuild-tag-data` and used by the force-rescan route; there
     is deliberately no way to run just one half from the command line.
 
+    The graph refresh is not forced: e621 only publishes the exports about
+    once a day, so when the manifest's checksums match what is already stored
+    the download/ingest is skipped and only the retrain runs.
+
     Returns {"graph": <graph result or None>, "dict": <retrain stats or None>}.
-    The graph refresh is forced, so a None there means the dumps could not be
-    obtained at all; a None dict means there was nothing cached to rewrite.
-    Neither is an error, and the retrain runs either way — it still re-reduces
+    A None graph means the exports were already current or could not be
+    obtained; a None dict means there was nothing cached to rewrite. Neither
+    is an error, and the retrain runs either way — it still re-reduces
     against whatever graph is currently stored.
     """
-    graph = refresh_tag_graph(force=True, allow_download=allow_download)
+    graph = refresh_tag_graph(force=False, allow_download=allow_download)
     stats = retrain_tag_dict()
     if stats is None:
         log.info("Post tag cache retrain: nothing to do.")
