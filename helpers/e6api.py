@@ -77,12 +77,23 @@ def post_file(post):
     }
 
 
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
 def post_sample_url(post):
-    """Preferred display URL: the resized sample jpg, else the original."""
+    """Preferred display URL: the resized sample jpg, else the original.
+
+    Only URLs an <img> can render count. When a post has no sample, v2 fills
+    sample.jpg with the original file's URL — for flash that's the .swf
+    itself, which the browser can't decode — so non-image URLs yield None.
+    """
     files = post.get("files") or {}
     sample = files.get("sample") or {}
     original = files.get("original") or {}
-    return sample.get("jpg") or original.get("url")
+    for url in (sample.get("jpg"), original.get("url")):
+        if url and url.lower().endswith(_IMG_EXTS):
+            return url
+    return None
 
 
 def post_is_viewable(post):
