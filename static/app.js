@@ -152,6 +152,27 @@ function renderTags(container, tagList, category) {
   }
 }
 
+/**
+ * Chip state is baked into each post when it's fetched, so posts already
+ * buffered or review-cached would show stale colors. Patch them in place.
+ */
+function syncCachedTagState(tag, addition, known) {
+  const lower = tag.toLowerCase();
+  const patch = (data) => {
+    if (!data) return;
+    for (const list of [data.artists, data.characters]) {
+      for (const t of list || []) {
+        if (t.tag.toLowerCase() === lower) {
+          t.addition = addition;
+          t.known = known;
+        }
+      }
+    }
+  };
+  for (const p of bufferQueue) patch(p);
+  for (const entry of reviewCache.values()) patch(entry.data);
+}
+
 async function toggleAddition(el, tag, category) {
   const isAdded = el.classList.contains("added") || el.classList.contains("addition");
   if (el.classList.contains("known") && !isAdded) return;
@@ -180,11 +201,13 @@ async function toggleAddition(el, tag, category) {
         } else {
           el.title = `Click to add to ${category} additions (click again to remove)`;
         }
+        syncCachedTagState(tag, false, !!data.known);
         refreshStats();
       }
     } else {
       if (data.ok) {
         el.classList.add("added");
+        syncCachedTagState(tag, true, true);
         refreshStats();
       } else if (data.reason === "already_known") {
         el.classList.add("known");
