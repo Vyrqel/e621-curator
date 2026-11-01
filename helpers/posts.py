@@ -288,6 +288,29 @@ def _fetch_posts_by_ids(ids):
     return fetch_posts(tag, page=1)
 
 
+# Deletion is effectively one-way, so a post's answer is cached for the life
+# of the process -- revisiting a post (or its siblings) costs no requests.
+_deleted_cache = {}
+
+
+def find_deleted_post_ids(ids):
+    """Return the subset of `ids` that are deleted (or gone) on e621.
+
+    Used to hide dead parent/child links. One request covers every uncached
+    ID; posts absent from the response no longer exist at all and count as
+    deleted too. Raises on fetch failure so the caller can fail open.
+    """
+    missing = [i for i in ids if i not in _deleted_cache]
+    if missing:
+        found = {p["id"]: p for p in _fetch_posts_by_ids(missing)}
+        for pid in missing:
+            post = found.get(pid)
+            _deleted_cache[pid] = post is None or bool(
+                (post.get("flags") or {}).get("deleted")
+            )
+    return {i for i in ids if _deleted_cache[i]}
+
+
 def purge_post(post_id):
     """Remove every local trace of a post that no longer exists on e621.
 

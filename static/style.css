@@ -900,6 +900,11 @@ body.disconnected .meta-value a {
   gap: 4px 12px;
 }
 
+/* Parent/child posts already in seen history. */
+.relation-links a.meta-value.seen {
+  color: var(--ok);
+}
+
 /* The wrapper is a layout no-op — its rows become direct .meta flex items,
    so an empty relations set contributes no gap under the post link. */
 #relations-rows {

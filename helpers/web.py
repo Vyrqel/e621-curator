@@ -16,7 +16,7 @@ from .e6api import (
     post_is_viewable,
 )
 from .maintenance import _maintenance_pass
-from .posts import expand_child_metatag, mark_post_seen
+from .posts import expand_child_metatag, find_deleted_post_ids, mark_post_seen
 from .runtime import app, log
 from .scanner import _scan_exhausted_queries, clear_all_page1_cache
 from .search import (
@@ -258,6 +258,34 @@ def api_seen():
     if from_primed and query:
         decrement_primed_count(query)
     return jsonify({"ok": True})
+
+
+@app.route("/api/relations/status")
+def api_relations_status():
+    """Deleted/seen status for a post's parent and child IDs.
+
+    Asked for at display time rather than baked into /api/next so a
+    preloaded post reflects what's been seen since it was fetched. If the
+    e621 lookup fails, nothing is reported deleted -- links stay visible.
+    """
+    raw = request.args.get("ids", "")
+    ids = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()})
+    if not ids:
+        return jsonify({"deleted": [], "seen": []})
+    try:
+        deleted = find_deleted_post_ids(ids)
+    except requests.RequestException as e:
+        log.warning(f"Relations status: deleted lookup failed: {e}")
+        deleted = set()
+    with db() as conn:
+        placeholders = ",".join("?" for _ in ids)
+        seen = {
+            r["post_id"]
+            for r in conn.execute(
+                f"SELECT post_id FROM seen WHERE post_id IN ({placeholders})", ids
+            )
+        }
+    return jsonify({"deleted": sorted(deleted), "seen": sorted(seen)})
 
 
 def _build_review_list(override_tags=None):

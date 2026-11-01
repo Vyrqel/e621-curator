@@ -43,6 +43,9 @@ let bufferFillBusy = false; // Reentrancy guard for the fill pass (see preloadNe
 let bufferEpoch = 0;      // Bumped on invalidation so stale fills discard results
 let busy = false;
 let inHistory = false;    // True when we're stepping back through seen history
+// post_id -> {deleted, seen} for parent/child links. Deletion is permanent;
+// seen only flips locally (markSeen keeps it current), so entries never expire.
+let relationStatus = new Map();
 
 // Review mode state — index-based navigation through ordered list of seen IDs
 let reviewList = null;    // Array of post IDs, in chronological seen_at order
@@ -319,6 +322,7 @@ function isReviewMode() {
  */
 function markSeen(postId) {
   if (!postId) return;
+  relationStatus.set(postId, { deleted: false, seen: true });
   const body = { post_id: postId };
   if (current && current.query) body.query = current.query;
   if (current && current.from_primed) body.from_primed = true;
@@ -358,12 +362,17 @@ async function fetchAndPreload(reviewPostId = null) {
     // Preload the image off-screen so it's ready when rendered. The Image
     // object is returned so callers can hold a reference, which keeps the
     // decoded bitmap from being dropped before we render it.
-    const img = await new Promise((resolve, reject) => {
-      const im = new Image();
-      im.onload = () => resolve(im);
-      im.onerror = () => reject(new Error("Failed to load image."));
-      im.src = data.sample_url;
-    });
+    // Relation status is warmed alongside, so the parent/child rows can
+    // render complete the moment the post is shown.
+    const [img] = await Promise.all([
+      new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error("Failed to load image."));
+        im.src = data.sample_url;
+      }),
+      fetchRelationStatus(relationPostIds(data.relations)),
+    ]);
 
     return { data, img };
   } catch (e) {
@@ -396,18 +405,41 @@ function renderRelations(rel) {
   box.innerHTML = "";
   if (!rel) return;
 
-  const rows = [];
-  if (rel.parent_id) {
-    rows.push({
-      label: "parent",
-      links: [{ text: `#${rel.parent_id}`, url: postUrl(rel.parent_id) }],
+  // Parent/child rows wait for deleted/seen status so they never flash a
+  // dead link or the wrong colour. Usually it's already cached (warmed at
+  // preload, or from an earlier visit) and they render right away.
+  const postIds = relationPostIds(rel);
+  const pending = postIds.filter((id) => !relationStatus.has(id));
+  if (pending.length) {
+    fetchRelationStatus(pending).then((ok) => {
+      if (current && current.relations === rel) buildRelationRows(rel, !ok);
     });
   }
-  if (rel.children && rel.children.length) {
-    rows.push({
-      label: rel.children.length === 1 ? "child" : "children",
-      links: rel.children.map((id) => ({ text: `#${id}`, url: postUrl(id) })),
-    });
+  buildRelationRows(rel, false, pending.length > 0);
+}
+
+/**
+ * Fill the relations box. `failOpen` shows parent/child links with no
+ * status (the lookup failed); `skipPosts` leaves them out (still loading).
+ */
+function buildRelationRows(rel, failOpen, skipPosts = false) {
+  const box = els.relationsRows;
+  box.innerHTML = "";
+
+  const postLink = (id) => {
+    const st = relationStatus.get(id);
+    if (!failOpen && (!st || st.deleted)) return null;
+    return { text: `#${id}`, url: postUrl(id), seen: !!(st && st.seen) };
+  };
+
+  const rows = [];
+  if (!skipPosts) {
+    const parent = rel.parent_id ? postLink(rel.parent_id) : null;
+    if (parent) rows.push({ label: "parent", links: [parent] });
+    const children = (rel.children || []).map(postLink).filter(Boolean);
+    if (children.length) {
+      rows.push({ label: children.length === 1 ? "child" : "children", links: children });
+    }
   }
   if (rel.pools && rel.pools.length) {
     rows.push({
@@ -430,6 +462,7 @@ function renderRelations(rel) {
     row.links.forEach((link) => {
       const a = document.createElement("a");
       a.className = "meta-value";
+      if (link.seen) a.classList.add("seen");
       a.target = "_blank";
       a.rel = "noopener";
       a.href = link.url;
@@ -440,6 +473,35 @@ function renderRelations(rel) {
 
     box.appendChild(rowEl);
   });
+}
+
+function relationPostIds(rel) {
+  if (!rel) return [];
+  return [rel.parent_id, ...(rel.children || [])].filter(Boolean);
+}
+
+/**
+ * Look up deleted/seen status for post IDs not already in relationStatus.
+ * Resolves true on success, false if the lookup failed (nothing cached, so
+ * a later render retries). Never rejects.
+ */
+async function fetchRelationStatus(postIds) {
+  const ids = postIds.filter((id) => !relationStatus.has(id));
+  if (!ids.length) return true;
+  try {
+    const r = await fetch(`/api/relations/status?ids=${ids.join(",")}`);
+    if (!r.ok) return false;
+    const status = await r.json();
+    const deleted = new Set(status.deleted || []);
+    const seen = new Set(status.seen || []);
+    ids.forEach((id) => {
+      relationStatus.set(id, { deleted: deleted.has(id), seen: seen.has(id) });
+    });
+    return true;
+  } catch (e) {
+    console.error("relation status failed:", e);
+    return false;
+  }
 }
 
 function postUrl(id) {

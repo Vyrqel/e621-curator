@@ -1,5 +1,7 @@
 import random
+import threading
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -30,6 +32,37 @@ from .store import (
 )
 from .taggraph import _tag_graph
 from .userfiles import _tag_matches, is_blacklisted, load_addition_tags
+
+# ---------- Ephemeral page cache ----------
+#
+# Non-persisted queries (overrides, multi-tag lines) have no last_page to
+# resume from, so every request re-walks from page 1. Holding recent pages in
+# memory turns that walk into dictionary lookups. Short TTL so new uploads
+# still surface; bounded so a long session doesn't hoard post JSON.
+
+EPHEMERAL_PAGE_TTL = 600  # seconds
+EPHEMERAL_PAGE_MAX = 40   # pages held at once, least-recently-used evicted
+
+_page_cache = OrderedDict()  # (query, page) -> (fetched_at, posts)
+_page_cache_lock = threading.Lock()
+
+
+def _fetch_posts_cached(query, page):
+    """fetch_posts() for non-persisted queries, served from memory when fresh."""
+    key = (query, page)
+    now = time.time()
+    with _page_cache_lock:
+        hit = _page_cache.get(key)
+        if hit and now - hit[0] < EPHEMERAL_PAGE_TTL:
+            _page_cache.move_to_end(key)
+            return hit[1]
+    posts = fetch_posts(query, page=page)
+    with _page_cache_lock:
+        _page_cache[key] = (now, posts)
+        _page_cache.move_to_end(key)
+        while len(_page_cache) > EPHEMERAL_PAGE_MAX:
+            _page_cache.popitem(last=False)
+    return posts
 
 
 def _find_unseen_post(query, seen, blacklist, persist=True, reserved=None):
@@ -68,7 +101,11 @@ def _find_unseen_post(query, seen, blacklist, persist=True, reserved=None):
         `servable` is `eligible` minus the reserved buffer, and is the only
         thing we may hand back.
         """
-        posts = fetch_posts(query, page=page)
+        posts = (
+            fetch_posts(query, page=page)
+            if persist
+            else _fetch_posts_cached(query, page)
+        )
         if not posts:
             return None, [], []  # past end of results
         eligible = [
