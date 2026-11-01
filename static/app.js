@@ -693,12 +693,15 @@ async function fetchNext() {
       const r = await fetch(`/api/history_forward?from_id=${fromId}`);
       if (r.ok) {
         const data = await r.json();
-        await new Promise((resolve) => {
-          const img = new Image();
-          img.onload = resolve;
-          img.onerror = resolve;
-          img.src = data.sample_url;
-        });
+        await Promise.all([
+          new Promise((resolve) => {
+            const img = new Image();
+            img.onload = resolve;
+            img.onerror = resolve;
+            img.src = data.sample_url;
+          }),
+          fetchRelationStatus(relationPostIds(data.relations)),
+        ]);
         renderPost(data);
         return;
       } else if (r.status === 404) {
@@ -778,12 +781,15 @@ async function goBack() {
     }
     const data = await r.json();
 
-    await new Promise((resolve) => {
-      const img = new Image();
-      img.onload = resolve;
-      img.onerror = resolve;
-      img.src = data.sample_url;
-    });
+    await Promise.all([
+      new Promise((resolve) => {
+        const img = new Image();
+        img.onload = resolve;
+        img.onerror = resolve;
+        img.src = data.sample_url;
+      }),
+      fetchRelationStatus(relationPostIds(data.relations)),
+    ]);
 
     inHistory = true;
     renderPost(data);

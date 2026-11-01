@@ -92,6 +92,13 @@ if __name__ == "__main__":
         "--refresh-tags it discards it and sweeps from the top.",
     )
     parser.add_argument(
+        "--sync-favorites",
+        action="store_true",
+        help="Sync favorites from e621 at startup. Off by default (the tag "
+        "backfill still runs); favorites are otherwise re-synced after each "
+        "automatic tag-export refresh and on a client-triggered rescan.",
+    )
+    parser.add_argument(
         "--rebuild-tag-data",
         action="store_true",
         help="Re-ingest the tags/alias/implication exports, then retrain the "
@@ -217,6 +224,6 @@ if __name__ == "__main__":
     reconcile_additions_files()
     adopt_bare_queries()
     check_blacklist_change()
-    start_maintenance(first=True)
+    start_maintenance(first=True, sync_favs=args.sync_favorites)
     start_tag_graph_sync()
     app.run(host=args.host, port=args.port, debug=False)

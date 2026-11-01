@@ -89,13 +89,15 @@ def sync_favorites():
 _maintenance_lock = threading.Lock()
 
 
-def _maintenance_pass(first=False):
+def _maintenance_pass(first=False, sync_favs=True):
     """One-shot: sync favorites, then backfill tag caches, then exit.
 
     Strictly ordered — the backfill's uncached set is only complete once the
     favorites sync has finished adding rows, so it always runs second. The
-    thread terminates when done; it is re-launched at startup and after a
-    client-triggered rescan rather than sleeping on a timer.
+    thread terminates when done; it is re-launched at startup, after a
+    client-triggered rescan, and after each fresh tag-export ingest rather
+    than sleeping on a timer. `sync_favs=False` runs the backfill alone;
+    startup does this unless --sync-favorites is given.
     """
     if not _maintenance_lock.acquire(blocking=False):
         log.info("Maintenance: already running — skipping duplicate launch.")
@@ -103,12 +105,15 @@ def _maintenance_pass(first=False):
     try:
         if first:
             _server_state["status"] = "initializing"
-        log.info("Favorites sync: activating.")
-        try:
-            sync_favorites()
-            log.info("Favorites sync: complete.")
-        except Exception as e:
-            log.error(f"Favorites sync: unhandled error: {e}")
+        if sync_favs:
+            log.info("Favorites sync: activating.")
+            try:
+                sync_favorites()
+                log.info("Favorites sync: complete.")
+            except Exception as e:
+                log.error(f"Favorites sync: unhandled error: {e}")
+        else:
+            log.info("Favorites sync: skipped at startup (pass --sync-favorites to enable).")
 
         log.info("Tag backfill: activating.")
         try:
@@ -123,11 +128,11 @@ def _maintenance_pass(first=False):
         _maintenance_lock.release()
 
 
-def start_maintenance(first=False):
+def start_maintenance(first=False, sync_favs=True):
     """Launch the favorites-sync → tag-backfill chain on its own thread."""
     t = threading.Thread(
         target=_maintenance_pass,
-        kwargs={"first": first},
+        kwargs={"first": first, "sync_favs": sync_favs},
         daemon=True,
         name="maintenance",
     )

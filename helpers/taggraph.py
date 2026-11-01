@@ -1430,6 +1430,7 @@ def _tag_graph_loop():
     """
     log.info("Tag export refresh thread started.")
     attempts_left = TAG_EXPORT_RETRY_ATTEMPTS
+    first_pass = True
     while True:
         log.info("Tag export refresh: activating.")
         try:
@@ -1452,6 +1453,15 @@ def _tag_graph_loop():
             # A fresh ingest replaced the whole tags table and both graph
             # blobs. Reclaim before going back to sleep.
             run_vacuum()
+
+        if changed and not first_pass:
+            # Ride the nightly ingest to pick up favorites added or removed on
+            # e621 since the last sync. Skipped on the startup pass, which
+            # start_maintenance(first=True) already covers (or was told not to).
+            from .maintenance import start_maintenance
+
+            start_maintenance()
+        first_pass = False
 
         if _local_csv:
             # Nothing will ever change underneath us; no point polling.
