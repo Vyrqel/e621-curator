@@ -176,6 +176,18 @@ function syncCachedTagState(tag, addition, known) {
   for (const entry of reviewCache.values()) patch(entry.data);
 }
 
+/**
+ * Mirror a favorite toggle into every cached copy of the post, so stepping
+ * away and back (review cache, buffer) shows the state we just set rather
+ * than the one it was fetched with.
+ */
+function syncCachedFavorite(postId, favorited) {
+  if (current && current.id === postId) current.is_favorited = favorited;
+  for (const p of bufferQueue) if (p && p.id === postId) p.is_favorited = favorited;
+  const entry = reviewCache.get(postId);
+  if (entry) entry.data.is_favorited = favorited;
+}
+
 async function toggleAddition(el, tag, category) {
   const isAdded = el.classList.contains("added") || el.classList.contains("addition");
   if (el.classList.contains("known") && !isAdded) return;
@@ -822,6 +834,7 @@ async function toggleFavorite() {
     const data = await r.json();
     if (data.ok) {
       setFavoriteState(!isFavorited);
+      syncCachedFavorite(current.id, !isFavorited);
       refreshStats();
     } else {
       console.error("Favorite toggle failed:", data.reason);
