@@ -3,8 +3,9 @@
 A local Flask app for working through an e621 search-query backlog without
 opening 4,000 browser tabs — and for keeping that backlog *alive* once you've
 worked through it. Exhausted queries get rescanned in the background, new
-posts get primed for review, favorites stay synced with your e621 account,
-and every post's tags are cached locally in a compressed binary format.
+posts get primed for review, favorites are re-synced with your e621 account
+alongside the nightly tag-data refresh, and every post's tags are cached
+locally in a compressed binary format.
 
 > **Built with heavy AI assistance.** Most of this codebase — including the
 > compressed tag storage, the export ingest pipeline, and the autocomplete
@@ -30,8 +31,9 @@ and every post's tags are cached locally in a compressed binary format.
    posts. Reservations are durable (`preload_queue`), so a post committed to
    the buffer is never served twice and never silently lost if the tab closes
    before it is displayed.
-7. Each post shows its parent, children and pool memberships, with one-click
-   searches for the rest of the family.
+7. Each post shows its parent, children and pool memberships as links to
+   e621. Deleted parents/children are hidden, and ones you've already seen are
+   shown in green.
 
 **Background machinery:**
 - **Scanner** — driven by tag-export deltas, not a timer. The blanket periodic
@@ -68,8 +70,13 @@ and every post's tags are cached locally in a compressed binary format.
   — it's what the ↺ force-rescan button calls, and it's exhaustive every time.
 - **Favorites sync** — enumerates your e621 favorites and reconciles them with
   the local table, both directions. Runs as the first half of the maintenance
-  chain (`start_maintenance`), which fires at startup and after a
-  client-triggered rescan rather than sleeping on a timer.
+  chain (`start_maintenance`), which fires after every fresh tag-export ingest
+  (roughly nightly) and after a client-triggered rescan rather than sleeping on
+  its own timer. It does **not** run at startup unless you pass
+  `--sync-favorites` — enumerating a large favorites list is slow, and the
+  maintenance chain still runs the tag backfill on its own at startup.
+  Favorites you toggle in the app are written locally and to e621 immediately,
+  so the sync only matters for changes made on e621 directly.
 - **Tag backfill** — the second half of that same chain, fetches tags for any
   locally-referenced post *missing* from the tag cache, batched via `id:a,b,c`
   + `status:any`. It only ever touches the uncached subset, so an idle pass is
@@ -146,14 +153,35 @@ python app.py [--host HOST] [--port PORT]
 Defaults to `0.0.0.0:8080` (all interfaces — handy for hitting it from a
 phone over Tailscale). Open <http://localhost:8080>.
 
+Startup flags (combine freely with the above):
+
+- `--sync-favorites` — run a full favorites sync at startup. Off by default;
+  favorites otherwise re-sync after each tag-export ingest and on ↺ rescan.
+- `--no-resume` — skip resuming an interrupted `--refresh-tags` sweep and
+  discard its checkpoint.
+- `--local-csv` — use copies of the tag exports in `./csv` instead of
+  fetching them from e621, downloading them there first if any are missing.
+  The tag-data thread then goes idle after its first pass, since nothing can
+  change underneath it. Also works with the maintenance flags below (e.g.
+  `--rebuild-tag-data`) to avoid hitting e621 while testing. Delete `./csv` to
+  pull fresh copies.
+
 ## UI features
 
 - **Override query** — type any e621 query into the top bar to browse it
-  directly instead of pulling from `queries.txt`. The **persist** checkbox
-  (default on) controls whether seen-marking applies; multi-tag overrides
-  never write query-tracking rows.
-- **Review mode** — re-browse posts you've already seen for a query, with a
-  jump-to-index counter.
+  directly instead of pulling from `queries.txt`. Also accepts an e621 search
+  URL or a post permalink. Posts you view are marked seen either way; the
+  **persist** checkbox (default on) controls whether the query's pagination
+  progress is saved to `query_progress`. Multi-tag overrides, URL-derived
+  overrides and `child:<id>` lookups never persist. Non-persisted queries keep
+  their fetched result pages in an in-memory cache (10 min TTL, 40 pages,
+  LRU) so each "next" doesn't re-walk the search from page 1; restarting the
+  server clears it.
+- **Review mode** — re-browse posts you've already seen (optionally filtered
+  by the override query, matched against the local tag cache), with a
+  jump-to-index counter. Nearby posts are preloaded; favorite toggles are
+  mirrored into the preloaded copies, so stepping away and back keeps the
+  state you set.
 - **History** — step backward/forward through the session's serve history.
 - **Force rescan** — the ↺ button (confirm-before-fire) triggers an immediate
   exhausted-query rescan, then favorites sync + tag backfill, then a tag-graph
@@ -163,8 +191,13 @@ phone over Tailscale). Open <http://localhost:8080>.
 - **Primed counter** — stats bar shows how many scanner-discovered new posts
   are waiting; decrements as you review them.
 - **Relations panel** — parent, children and pool links for the current post,
-  each with a one-click search that pulls the rest of the family into the
-  override bar.
+  opening on e621 in a new tab. Parent/child links are checked against e621
+  (`GET /api/relations/status`): deleted posts are hidden — dropping the row
+  if none are left — and posts already in your seen history show green. The
+  check runs while a post is preloading (and before history steps render), and
+  answers are cached both server-side (deletions, per process) and in the page,
+  so the rows appear complete rather than popping in. If the check fails, the
+  links show anyway.
 - **Tag autocomplete** — the override bar completes tags as you type, served
   from the local tag store (`GET /api/tags/suggest`). One ranked pool: real
   tags whose name starts with your fragment, merged with aliases whose
@@ -194,7 +227,8 @@ All in `curator.db`:
   user looked at it", this means "we owe the user a look at it". Rows leave by
   exactly two doors — `/api/seen` on display, or the drain when a post is
   re-served after the client dropped it. Nothing expires on a timer.
-- `favorites` — favorited posts, kept in sync with e621.
+- `favorites` — favorited posts. Written immediately when you toggle a
+  favorite in the app; reconciled with e621 by the favorites sync.
 - `additions` — the artist/character additions lists, mirrored to the two text
   files.
 - `post_relations` — parent ID, child IDs and pool IDs per post. Children and
@@ -261,6 +295,10 @@ tag cache, not your e621-side favorites.)
 - `GET /api/previous`, `GET /api/history_forward` — history navigation.
 - `POST /api/favorite`, `POST /api/unfavorite` — favoriting (hits e621 too).
 - `POST /api/addition`, `POST /api/addition/remove` — additions lists.
+- `GET /api/relations/status?ids=1,2,3` — which of the given post IDs are
+  deleted (or gone) on e621 and which are in seen history, as
+  `{"deleted": [...], "seen": [...]}`. Backs the relations panel; a failed
+  e621 lookup reports nothing deleted.
 - `GET /api/ping` — liveness/state for the connection indicator.
 - `GET /api/tags/suggest` — ranked tag completions for one fragment. Also
   completes after a tag-valued metatag (`fav:`, `pool:`, `set:`, `user:`,
@@ -350,6 +388,14 @@ These exit without starting the server:
   the `refresh_progress` checkpoint.
 - `--no-resume` — discard that checkpoint. With `--refresh-tags`, sweeps from
   the top; on normal startup, skips the resume entirely.
+- `--purge TAG` — permanently remove every seen post carrying `TAG` (aliases
+  and implications honored) from seen-history and the tag cache, and drop the
+  tag from `queries.txt` and both additions lists. Asks you to type `purge` to
+  confirm. Only posts with cached tags can be matched; favorites are kept.
+  Purged posts count as unseen again, so blacklist the tag too if you never
+  want them back.
+- `--blacklist TAGS` — append `TAGS` as a new line in `blacklist.txt`. Quote
+  multi-tag clauses: `--blacklist "alcohol -solo"`.
 - `--vacuum` — reclaim free pages. Runs automatically after
   `--rebuild-tag-data` and `--refresh-tags`; this is the manual handle for
   everything else. Never runs while the server is up, which is why a migration
@@ -410,4 +456,5 @@ pass through untouched.
 - Werkzeug per-request logging is filtered out; everything else logs to
   stdout. Restart the process manually after edits — startup runs DB
   maintenance (`init_db` → schema/migrations → purge/canonicalize) and kicks
-  off the background threads.
+  off the background threads. Static assets are cache-busted by file mtime, so
+  a page reload is enough to pick up frontend edits.
