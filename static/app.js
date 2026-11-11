@@ -56,6 +56,8 @@ let reviewCache = new Map();
 let reviewFilling = null; // Promise for the in-flight review preload pass
 let reviewFillBusy = false; // Reentrancy guard for the review preload pass
 let reviewEpoch = 0;      // Bumped when the review list changes
+let tagStateGen = 0;      // Bumped on every confirmed addition add/remove
+let tagStateChanges = new Map(); // lowercased tag -> {addition, known, gen}
 
 async function refreshStats() {
   try {
@@ -161,19 +163,37 @@ function renderTags(container, tagList, category) {
  */
 function syncCachedTagState(tag, addition, known) {
   const lower = tag.toLowerCase();
-  const patch = (data) => {
-    if (!data) return;
-    for (const list of [data.artists, data.characters]) {
-      for (const t of list || []) {
-        if (t.tag.toLowerCase() === lower) {
-          t.addition = addition;
-          t.known = known;
-        }
+  tagStateGen++;
+  tagStateChanges.set(lower, { addition, known, gen: tagStateGen });
+  for (const p of bufferQueue) patchTagState(p, lower, addition, known);
+  for (const entry of reviewCache.values()) patchTagState(entry.data, lower, addition, known);
+}
+
+function patchTagState(data, lower, addition, known) {
+  if (!data) return;
+  for (const list of [data.artists, data.characters]) {
+    for (const t of list || []) {
+      if (t.tag.toLowerCase() === lower) {
+        t.addition = addition;
+        t.known = known;
       }
     }
-  };
-  for (const p of bufferQueue) patch(p);
-  for (const entry of reviewCache.values()) patch(entry.data);
+  }
+}
+
+/**
+ * Patching the caches misses posts that were still in flight when the tag
+ * changed: their JSON may have been built before the change was committed,
+ * and they land in the buffer afterwards with stale chip state. So every
+ * fetched post is stamped with the generation its request started at, and
+ * any change recorded after that is re-applied just before rendering.
+ */
+function applyNewerTagState(data) {
+  if (!data || data._tagGen == null) return;
+  for (const [lower, c] of tagStateChanges) {
+    if (c.gen > data._tagGen) patchTagState(data, lower, c.addition, c.known);
+  }
+  data._tagGen = tagStateGen;
 }
 
 /**
@@ -353,6 +373,7 @@ function markSeen(postId) {
  * In normal mode: routes through /api/next with override/exclude params.
  */
 async function fetchAndPreload(reviewPostId = null) {
+  const tagGen = tagStateGen;
   try {
     let r;
     if (isReviewMode()) {
@@ -370,6 +391,7 @@ async function fetchAndPreload(reviewPostId = null) {
     }
     const data = await r.json();
     if (!r.ok) return { error: data.error || "Unknown error" };
+    data._tagGen = tagGen;
 
     // Preload the image off-screen so it's ready when rendered. The Image
     // object is returned so callers can hold a reference, which keeps the
@@ -525,6 +547,7 @@ function poolUrl(id) {
 }
 
 function renderPost(data) {
+  applyNewerTagState(data);
   current = data;
   els.image.src = data.sample_url;
   els.image.hidden = false;
@@ -702,9 +725,11 @@ async function fetchNext() {
     if (inHistory) {
       showLoading();
       const fromId = current ? current.id : "";
+      const tagGen = tagStateGen;
       const r = await fetch(`/api/history_forward?from_id=${fromId}`);
       if (r.ok) {
         const data = await r.json();
+        data._tagGen = tagGen;
         await Promise.all([
           new Promise((resolve) => {
             const img = new Image();
@@ -785,6 +810,7 @@ async function goBack() {
     // Normal mode: history-walk back through seen posts
     showLoading();
     const fromId = current ? current.id : "";
+    const tagGen = tagStateGen;
     const r = await fetch(`/api/previous?from_id=${fromId}`);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
@@ -792,6 +818,7 @@ async function goBack() {
       return;
     }
     const data = await r.json();
+    data._tagGen = tagGen;
 
     await Promise.all([
       new Promise((resolve) => {
